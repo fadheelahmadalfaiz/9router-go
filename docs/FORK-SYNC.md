@@ -76,13 +76,55 @@ luqman-v1/9router-go  (upstream, sumber perubahan)
         ▼
 Sync Upstream  ──merge -X theirs──►  main di fork
         │
-        │  push ke main
-        ▼
-CI  (build web + go vet + go test + go build)
+        ├─►  CI  (web build + go vet + go test + go build)
         │
-        │  autoDeploy
-        ▼
-Easypanel  ──docker build──►  image  ──swarm update──►  app_9router-go
+        └─►  Publish Image  (multi-arch → GHCR, cache GHA)
+                    │
+                    │  ghcr.io/fadheelahmadalfaiz/9router-go:tag
+                    ▼
+              Easypanel  ──docker pull──►  app_9router-go
 ```
 
 `Release` hanya jalan saat ada tag `v*` (rilis upstream), tidak tiap sync.
+
+---
+
+## Image: `ghcr.io/fadheelahmadalfaiz/9router-go`
+
+Workflow `.github/workflows/publish-image.yml` mem-build image multi-arch
+(`linux/amd64` + `linux/arm64`) lalu push ke GHCR setiap ada push ke `main`.
+
+### Tags
+
+| Tag         | Arti                                                       |
+| ----------- | ---------------------------------------------------------- |
+| `latest`    | Build terbaru dari `main`                                   |
+| `main`      | Alias bergerak, sama dengan `latest`                         |
+| `sha-xxxxxx`| Commit spesifik, immutable — dipakai untuk rollback        |
+| `<VERSION>` | Dari file `VERSION`, misal `1.9.5`                          |
+| `v<VERSION>`| Sama dengan di atas, mengikuti konvensi tag rilis            |
+
+### Pakai di server
+
+```bash
+docker pull ghcr.io/fadheelahmadalfaiz/9router-go:latest
+
+docker run -d --name 9router-go --restart unless-stopped \
+  -p 20130:20130 \
+  -v /etc/easypanel/projects/app/9router-go/data:/root/.9router \
+  -e PORT=20130 \
+  -e INITIAL_PASSWORD='your-password' \
+  ghcr.io/fadheelahmadalfaiz/9router-go:latest
+```
+
+### Trigger manual (dry run)
+
+Lewat tab **Actions → Publish Image → Run workflow**, uncheck `push` untuk
+build tanpa push — berguna saat mau memastikan build-nya sehat dulu.
+
+### Build lambat, cache cepat
+
+Multi-arch lewat QEMU took **~13 menit** untuk build pertama. Setelah itu
+`cache-from`/`cache-to: type=gha,mode=max` membuat build berikutnya jauh lebih
+cepat. Job memakai `cancel-in-progress: true`, jadi kalau upstream commit
+menyusul saat build berjalan, yang lama dibatalkan dan yang baru pakai cache.
