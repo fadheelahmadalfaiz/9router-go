@@ -37,3 +37,8 @@ stitch-screenshots/
 # them as embedded gitlinks. A worktree caught in a commit has to be undone
 # with `git rm --cached` before it reaches the remote.
 .worktrees/
+
+# Agent scratch: session plans and run-continuation state. Both are machine
+# local, and a git add -A would otherwise stage them by accident.
+.omo/
+.tmp/
