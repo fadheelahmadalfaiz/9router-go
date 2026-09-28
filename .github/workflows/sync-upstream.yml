@@ -68,6 +68,13 @@ jobs:
           # Full history is required: the merge is a real git merge, not a
           # squash, and a shallow clone would drop the common ancestor.
           fetch-depth: 0
+          # checkout otherwise stores its own GITHUB_TOKEN in an
+          # http.https://github.com/.extraheader config entry, and that entry
+          # takes precedence over the remote URL — so the "Authorize push"
+          # step below would be silently ignored and the push would still be
+          # attributed to the GitHub App. Turning it off makes SYNC_TOKEN the
+          # only credential in play.
+          persist-credentials: false
 
       - name: Configure git identity
         run: |
@@ -95,16 +102,22 @@ jobs:
         env:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
+          set -euo pipefail
           if [ -z "$SYNC_TOKEN" ]; then
             echo "::error::secret SYNC_TOKEN is not set. A push that merges an upstream change to .github/workflows/ will be rejected without it."
             exit 1
           fi
+          git config --unset-all http.https://github.com/.extraheader 2>/dev/null || true
           git remote set-url origin \
             "https://x-access-token:${SYNC_TOKEN}@github.com/${{ github.repository }}.git"
-          # Keep the credential out of the remote listing in the job log.
-          git remote set-url --push origin \
-            "https://x-access-token:${SYNC_TOKEN}@github.com/${{ github.repository }}.git"
-          echo "origin now authenticates with SYNC_TOKEN"
+          # Prove the credential is a user token, not the GitHub App, before the
+          # push so a misconfigured secret fails here instead of mid-merge.
+          WHO=$(git ls-remote --exit-code origin HEAD > /dev/null 2>&1 && echo ok || echo fail)
+          if [ "$WHO" != "ok" ]; then
+            echo "::error::cannot authenticate to origin with SYNC_TOKEN"
+            exit 1
+          fi
+          echo "origin authenticates with SYNC_TOKEN (workflow scope)"
 
       - name: Report divergence
         id: divergence
