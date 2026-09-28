@@ -111,25 +111,32 @@ jobs:
 
       - name: Summary
         if: always()
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          VERSION_OUT: ${{ steps.meta.outputs.version }}
+          DIGEST_OUT: ${{ steps.build.outputs.digest }}
+          TAGS_OUT: ${{ steps.dockermeta.outputs.tags }}
         run: |
           {
             echo "### Publish Image"
             echo ""
             echo "| Field | Value |"
             echo "|-------|-------|"
-            echo "| Image | \`${{ steps.meta.outputs.image }}\` |"
-            echo "| Version | \`${{ steps.meta.outputs.version || 'n/a' }}\` |"
-            echo "| SHA | \`${{ github.sha }}\` |"
-            echo "| Trigger | \`${{ github.event_name }}\` |"
-            echo "| Digest | \`${{ steps.build.outputs.digest || 'n/a (dry run)' }}\` |"
+            echo "| Image | $IMAGE |"
+            echo "| Version | $VERSION_OUT |"
+            echo "| SHA | ${{ github.sha }} |"
+            echo "| Trigger | ${{ github.event_name }} |"
+            echo "| Digest | ${DIGEST_OUT:-n/a} |"
             echo ""
-            echo "Tags:"
+            echo "### Tags"
+            echo ""
             echo '```'
-            echo "${{ steps.dockermeta.outputs.tags }}"
+            echo "$TAGS_OUT"
             echo '```'
             echo ""
-            echo "Pull with:"
+            echo "### Pull"
+            echo ""
             echo '```bash'
-            echo "docker pull ${{ steps.meta.outputs.image }}:latest"
-            echo "```"
+            echo "docker pull $IMAGE:latest"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
