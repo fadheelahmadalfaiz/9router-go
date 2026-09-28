@@ -80,6 +80,32 @@ jobs:
           git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git"
           git fetch --no-tags upstream "${{ env.UPSTREAM_BRANCH }}:refs/remotes/upstream/${{ env.UPSTREAM_BRANCH }}"
 
+      - name: Authorize push with a workflow-capable token
+        # The built-in GITHUB_TOKEN is rejected by the remote for any push that
+        # touches .github/workflows/:
+        #   refusing to allow a GitHub App to create or update workflow
+        #   `.github/workflows/ci.yml` without `workflows` permission
+        # That block cannot be lifted from the `permissions:` key (there is no
+        # such key), and the repo-level "Read and write permissions" setting
+        # does not change it either. Upstream regularly edits ci.yml and
+        # release.yml, so the sync has to authenticate with a token that
+        # carries the `workflow` scope. SYNC_TOKEN is a classic PAT with
+        # `repo` + `workflow`; without it every scheduled sync that pulls a CI
+        # change fails on push.
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::secret SYNC_TOKEN is not set. A push that merges an upstream change to .github/workflows/ will be rejected without it."
+            exit 1
+          fi
+          git remote set-url origin \
+            "https://x-access-token:${SYNC_TOKEN}@github.com/${{ github.repository }}.git"
+          # Keep the credential out of the remote listing in the job log.
+          git remote set-url --push origin \
+            "https://x-access-token:${SYNC_TOKEN}@github.com/${{ github.repository }}.git"
+          echo "origin now authenticates with SYNC_TOKEN"
+
       - name: Report divergence
         id: divergence
         run: |
@@ -132,17 +158,32 @@ jobs:
         run: |
           set -uo pipefail
           # Someone (a manual commit, the Publish-Image job, or a PR merge) can
-          # land on main between our checkout and this push. Rebase onto the new
-          # tip and retry once instead of failing the whole scheduled run.
+          # land on main between our checkout and this push, making it
+          # non-fast-forward. Re-do the merge on top of the new tip rather than
+          # rebasing: this commit is a merge, and `git rebase` drops merge
+          # commits, which would silently rewrite the recorded sync.
+          MERGE_MSG="chore(sync): merge upstream ${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }}"
           for ATTEMPT in 1 2 3; do
             if git push origin "HEAD:${{ env.BRANCH }}"; then
               echo "Pushed merge to origin/${{ env.BRANCH }} (attempt $ATTEMPT)"
               exit 0
             fi
-            echo "::warning::push rejected on attempt $ATTEMPT; rebasing onto the new origin tip"
+            echo "::warning::push rejected on attempt $ATTEMPT"
+
+            if [ "$ATTEMPT" -eq 3 ]; then
+              break
+            fi
+
             git fetch origin "${{ env.BRANCH }}"
-            # Drop the merge commit, replay only its content on top of origin.
-            git rebase "origin/${{ env.BRANCH }}" || git rebase --abort
+            # Reset to the new origin tip, then replay the upstream merge on it.
+            git reset --hard "origin/${{ env.BRANCH }}"
+            if ! git merge --no-edit -X theirs \
+                 "upstream/${{ env.UPSTREAM_BRANCH }}" \
+                 -m "$MERGE_MSG (${{ github.run_id }})"; then
+              echo "::error::merge conflict against the new origin tip; resolve by hand"
+              git status --short
+              exit 1
+            fi
             sleep 5
           done
           echo "::error::could not push the merge after 3 attempts"
