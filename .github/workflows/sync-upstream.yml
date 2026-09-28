@@ -1,0 +1,126 @@
+name: Sync Upstream
+
+# Keeps this fork's `main` aligned with its real upstream so fixes and provider
+# updates land here without a manual merge. Runs on a schedule, on manual
+# dispatch, and whenever upstream pushes (via `repository_dispatch` sent by the
+# upstream repo's own notify job, if configured).
+#
+# Merge strategy mirrors the previous 9router `sync-mibp` behaviour: merge
+# upstream into this branch with `-X theirs` so upstream wins on conflict. The
+# fork intentionally carries no local patches, so a conflict means an upstream
+# file this fork customized — resolve by hand instead of silently discarding.
+#
+# NOTE: `cancel-in-progress: false` is deliberate. Overlapping runs against the
+# same branch race on the push and can leave the working tree mid-rebase; a
+# queued run is cheaper than a broken branch.
+
+on:
+  schedule:
+    # Hourly at :07 — offset from the 15-minute slot the 9router sync used so
+    # the two forks never contend for the same runner window.
+    - cron: "7 * * * *"
+  workflow_dispatch:
+    inputs:
+      skip_build:
+        description: "Merge upstream but do not trigger a container rebuild"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  # The real upstream for this fork.
+  UPSTREAM_REPO: luqman-v1/9router-go
+  UPSTREAM_BRANCH: main
+  BRANCH: main
+
+jobs:
+  sync:
+    name: Merge upstream into fork
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+      merged: ${{ steps.merge.outputs.merged }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          # Full history is required: the merge is a real git merge, not a
+          # squash, and a shallow clone would drop the common ancestor.
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git"
+          git fetch --no-tags upstream "${{ env.UPSTREAM_BRANCH }}:refs/remotes/upstream/${{ env.UPSTREAM_BRANCH }}"
+
+      - name: Report divergence
+        id: divergence
+        run: |
+          BEHIND=$(git rev-list --count "HEAD..upstream/${{ env.UPSTREAM_BRANCH }}" || echo 0)
+          AHEAD=$(git rev-list --count "upstream/${{ env.UPSTREAM_BRANCH }}..HEAD" || echo 0)
+          {
+            echo "behind=$BEHIND"
+            echo "ahead=$AHEAD"
+          } >> "$GITHUB_OUTPUT"
+          echo "behind upstream by $BEHIND commit(s); ahead by $AHEAD"
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "::notice::Fork is already up to date with ${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }}"
+          fi
+
+      - name: Merge upstream
+        id: merge
+        if: steps.divergence.outputs.behind != '0'
+        run: |
+          set -euo pipefail
+          git merge --no-edit \
+            -X theirs \
+            "upstream/${{ env.UPSTREAM_BRANCH }}" \
+            -m "chore(sync): merge upstream ${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }} (${{ github.run_id }})"
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verify build after merge
+        if: steps.merge.outputs.merged == 'true'
+        run: |
+          set -euo pipefail
+          echo "::group::git status"
+          git status --short
+          echo "::endgroup::"
+          echo "::group::merged files"
+          git diff --stat "HEAD^" HEAD | tail -40
+          echo "::endgroup::"
+
+      - name: Push to fork
+        if: steps.merge.outputs.merged == 'true'
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:${{ env.BRANCH }}"
+          echo "Pushed merge to origin/${{ env.BRANCH }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Sync Upstream"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Upstream | \`${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }}\` |"
+            echo "| Branch | \`${{ env.BRANCH }}\` |"
+            echo "| Behind before sync | ${{ steps.divergence.outputs.behind }} |"
+            echo "| Local commits ahead | ${{ steps.divergence.outputs.ahead }} |"
+            echo "| Merged | ${{ steps.merge.outputs.merged || 'no (already up to date)' }} |"
+            echo "| Run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
