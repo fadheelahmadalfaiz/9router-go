@@ -122,7 +122,7 @@ func TestFetchProviderUsage_DispatchesCodex(t *testing.T) {
 	withCodexUsageServer(t, http.StatusOK, `{"rate_limit":{"primary_window":{"used_percent":1}}}`)
 
 	data := map[string]any{"accessToken": "tok", "apiKey": "tok"}
-	res, ok := fetchProviderUsage(t.Context(), "codex", data)
+	res, ok := fetchProviderUsage(t.Context(), "codex", data, false)
 	if !ok {
 		t.Fatal("expected fetchProviderUsage to handle codex")
 	}

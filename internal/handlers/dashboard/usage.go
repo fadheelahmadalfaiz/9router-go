@@ -65,13 +65,17 @@ func (h *DashboardHandler) HandleGetConnectionUsage(w http.ResponseWriter, r *ht
 		_ = json.Unmarshal([]byte(conn.Data), &data)
 	}
 
+	// ?force=1 is the dashboard's manual per-row refresh: it must bypass the
+	// per-token caches so a user asking again actually gets a new read.
+	force := r.URL.Query().Get("force") == "1"
+
 	// Live provider quota fetchers (ports of open-sse/services/usage/*.js).
 	// Antigravity keeps its existing dedicated path below.
 	if !acquireQuotaSlot(w, r) {
 		return
 	}
 
-	if res, ok := fetchProviderUsage(r.Context(), conn.Provider, data); ok {
+	if res, ok := fetchProviderUsage(r.Context(), conn.Provider, data, force); ok {
 		handlerutil.WriteJSON(w, http.StatusOK, res.toResponse())
 		return
 	}
@@ -98,33 +102,19 @@ func (h *DashboardHandler) HandleGetConnectionUsage(w http.ResponseWriter, r *ht
 		}
 	}
 
-	// Fallback for connections with rate limit or locks in data
-	respQuotas := make(map[string]any)
-	if data != nil {
-		if rateLimitedUntil, ok := data["rateLimitedUntil"].(string); ok && rateLimitedUntil != "" {
-			respQuotas["default"] = map[string]any{
-				"remainingPercentage": 0,
-				"resetAt":             rateLimitedUntil,
-				"displayName":         conn.Provider,
-			}
-		}
-		for k, v := range data {
-			if len(k) > 10 && k[:10] == "modelLock_" {
-				model := k[10:]
-				if lockStr, ok := v.(string); ok && lockStr != "" {
-					respQuotas[model] = map[string]any{
-						"remainingPercentage": 0,
-						"resetAt":             lockStr,
-						"displayName":         model,
-					}
-				}
-			}
-		}
-	}
-
+	// Upstream parity: a provider with no usage handler answers with a plain
+	// message (open-sse/services/usage.js — "Usage API not implemented for
+	// <provider>"), never with synthesized rows.
+	//
+	// This port used to fabricate quota rows out of the connection's
+	// `modelLock_*` / `rateLimitedUntil` health fields. Those rows carried no
+	// counts, so the tracker drew them as "0 / ∞" stuck at 0% with an empty
+	// bar — indistinguishable from a genuinely exhausted account, and it
+	// poisoned the "Turn off Empty" bulk action. Health and lock state stay
+	// visible where they belong: ProviderDetailView and the routing health
+	// checks.
 	handlerutil.WriteJSON(w, http.StatusOK, map[string]any{
-		"plan":   conn.Provider,
-		"quotas": respQuotas,
+		"message": "Usage API not implemented for " + conn.Provider,
 	})
 }
 

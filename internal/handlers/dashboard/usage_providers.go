@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -66,7 +65,10 @@ func (r usageResult) toResponse() map[string]any {
 // fetchProviderUsage dispatches a live quota fetch for providers with a
 // ported usage handler. Returns ok=false for unhandled providers (caller
 // falls back to locks/antigravity paths).
-func fetchProviderUsage(ctx context.Context, provider string, data map[string]any) (usageResult, bool) {
+//
+// force skips the handlers that cache per token (claude), matching upstream's
+// manual-refresh path; it is ignored by the handlers that read live state.
+func fetchProviderUsage(ctx context.Context, provider string, data map[string]any, force bool) (usageResult, bool) {
 	accessToken, apiKey, psd := usageCreds(data)
 	switch provider {
 	case "deepseek":
@@ -83,12 +85,34 @@ func fetchProviderUsage(ctx context.Context, provider string, data map[string]an
 		return fetchQoderUsageAt(ctx, firstNonEmptyStr(accessToken, apiKey), "https://openapi.qoder.com.cn/api/v2/quota/usage"), true
 	case "codebuddy-intl":
 		return fetchCodeBuddyIntlUsage(ctx, accessToken, apiKey), true
+	case "codebuddy-cn":
+		return fetchCodeBuddyCnUsage(ctx, accessToken, apiKey), true
 	case "kiro":
 		return fetchKiroUsage(ctx, accessToken, psd), true
 	case "grok-cli":
 		return fetchGrokCliUsage(ctx, accessToken, psd), true
 	case "codex":
 		return fetchCodexUsage(ctx, firstNonEmptyStr(accessToken, apiKey)), true
+	case "minimax", "minimax-cn":
+		return fetchMiniMaxUsage(ctx, firstNonEmptyStr(apiKey, accessToken), provider), true
+	case "claude":
+		return fetchClaudeUsage(ctx, accessToken, force), true
+	case "github":
+		return fetchGitHubUsage(ctx, accessToken), true
+	case "gemini-cli":
+		return fetchGeminiCLIUsage(ctx, accessToken, psd), true
+	case "glm", "glm-cn":
+		return fetchGlmUsage(ctx, apiKey, provider), true
+	case "kimi":
+		return fetchKimiUsage(ctx, accessToken, apiKey, psd), true
+	case "zed":
+		return fetchZedUsage(ctx, accessToken, psd), true
+	case "freebuff":
+		return fetchFreebuffUsage(ctx, accessToken), true
+	case "vercel-ai-gateway":
+		return fetchVercelCredits(ctx, apiKey), true
+	case "iflow":
+		return fetchIflowUsage(ctx), true
 	default:
 		return usageResult{}, false
 	}
@@ -223,6 +247,19 @@ func usageStr(v any) string {
 		return s
 	}
 	return ""
+}
+
+// usageErrorSnippet renders an upstream error body for a dashboard message,
+// capped so a proxy's HTML error page cannot flood the card.
+func usageErrorSnippet(out []byte, status int) string {
+	snippet := strings.TrimSpace(string(out))
+	if len(snippet) > 200 {
+		snippet = snippet[:200]
+	}
+	if snippet == "" {
+		return fmt.Sprintf("HTTP %d", status)
+	}
+	return fmt.Sprintf("HTTP %d: %s", status, snippet)
 }
 
 // usageResetTime mirrors upstream parseResetTime: unix s/ms, numeric strings,
@@ -830,164 +867,6 @@ func fetchQoderUsageAt(ctx context.Context, accessToken, usageURL string) usageR
 	}
 	return usageResult{quotas: quotas, extra: extra}
 }
-
-// ---------- codebuddy-intl: POST billing meter ----------
-
-var codebuddyIntlHeaders = map[string]string{
-	"User-Agent":          "IDE/2.108.1 CodeBuddy/2.108.1",
-	"X-Product":           "SaaS",
-	"X-IDE-Type":          "IDE",
-	"X-IDE-Name":          "IDE",
-	"X-Requested-With":    "XMLHttpRequest",
-	"X-Codebuddy-Request": "1",
-	"Content-Type":        "application/json",
-	"Accept":              "application/json",
-}
-
-func codebuddyNum(precise, plain any) float64 {
-	if s, ok := precise.(string); ok && strings.TrimSpace(s) != "" {
-		if f, err := strconv.ParseFloat(strings.TrimSpace(s), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
-			return f
-		}
-	}
-	return usageNum(plain, 0)
-}
-
-func codebuddyCycleEndMs(acc map[string]any) float64 {
-	if s := usageResetTime(acc["CycleEndTime"]); s != "" {
-		if tm, err := time.Parse(time.RFC3339, s); err == nil {
-			return float64(tm.UnixMilli())
-		}
-	}
-	return math.Inf(1)
-}
-
-func codebuddyIsRefill(acc map[string]any) bool {
-	ce := codebuddyCycleEndMs(acc)
-	// DeductionEndTime arrives in unix MILLISECONDS (e.g. 1790429257000);
-	// upstream compares it directly against the cycle-end ms.
-	de, ok := usageFiniteNum(acc["DeductionEndTime"])
-	if math.IsInf(ce, 1) || !ok {
-		return false
-	}
-	return de-ce > float64(2*24*60*60*1000)
-}
-
-func codebuddyCadence(acc map[string]any) string {
-	start, end := usageResetTime(acc["CycleStartTime"]), usageResetTime(acc["CycleEndTime"])
-	if start != "" && end != "" {
-		if ts, err1 := time.Parse(time.RFC3339, start); err1 == nil {
-			if te, err2 := time.Parse(time.RFC3339, end); err2 == nil {
-				days := te.Sub(ts).Hours() / 24
-				if days <= 1.5 {
-					return "Daily"
-				}
-				if days <= 10 {
-					return "Weekly"
-				}
-			}
-		}
-	}
-	return "Monthly"
-}
-
-func fetchCodeBuddyIntlUsage(ctx context.Context, accessToken, apiKey string) usageResult {
-	token := firstNonEmptyStr(accessToken, apiKey)
-	if token == "" {
-		return usageResult{message: "CodeBuddy (codebuddy-intl) credential not available."}
-	}
-	headers := map[string]string{"Authorization": "Bearer " + token}
-	for k, v := range codebuddyIntlHeaders {
-		headers[k] = v
-	}
-	status, _, out, err := usageDo(ctx, http.MethodPost, "https://www.codebuddy.ai/v2/billing/meter/get-user-resource", headers, []byte("{}"))
-	if err != nil {
-		return usageResult{message: fmt.Sprintf("CodeBuddy (codebuddy-intl) error: %v", err)}
-	}
-	if status == 401 || status == 403 {
-		return usageResult{message: "CodeBuddy CN credential invalid or expired."}
-	}
-	if status < 200 || status >= 300 {
-		return usageResult{message: fmt.Sprintf("CodeBuddy CN quota API error (%d).", status)}
-	}
-	body := usageJSON(out)
-	if body == nil {
-		return usageResult{message: "CodeBuddy (codebuddy-intl) error: invalid JSON"}
-	}
-	if code := usageNum(body["code"], -1); code != 0 {
-		msg, _ := body["msg"].(string)
-		if msg == "" {
-			msg = "unknown"
-		}
-		return usageResult{message: fmt.Sprintf("CodeBuddy CN quota error: %s", msg)}
-	}
-	var data map[string]any
-	if d, ok := body["data"].(map[string]any); ok {
-		if r, ok := d["Response"].(map[string]any); ok {
-			data, _ = r["Data"].(map[string]any)
-		}
-	}
-	var accounts []any
-	if a, ok := data["Accounts"].([]any); ok {
-		accounts = a
-	}
-	if len(accounts) == 0 {
-		return usageResult{message: "CodeBuddy CN connected. No credit package found."}
-	}
-	var refills, bonuses []map[string]any
-	for _, a := range accounts {
-		if acc, ok := a.(map[string]any); ok {
-			if codebuddyIsRefill(acc) {
-				refills = append(refills, acc)
-			} else {
-				bonuses = append(bonuses, acc)
-			}
-		}
-	}
-	sort.SliceStable(refills, func(i, j int) bool { return codebuddyCycleEndMs(refills[i]) < codebuddyCycleEndMs(refills[j]) })
-	sort.SliceStable(bonuses, func(i, j int) bool { return codebuddyCycleEndMs(bonuses[i]) < codebuddyCycleEndMs(bonuses[j]) })
-	quotas := map[string]any{}
-	seen := map[string]int{}
-	for _, acc := range refills {
-		base := codebuddyCadence(acc)
-		seen[base]++
-		name := base
-		if seen[base] > 1 {
-			name = fmt.Sprintf("%s %d", base, seen[base])
-		}
-		quotas[name] = map[string]any{
-			"used":      codebuddyNum(acc["CycleCapacityUsedPrecise"], acc["CycleCapacityUsed"]),
-			"total":     codebuddyNum(acc["CycleCapacitySizePrecise"], acc["CycleCapacitySize"]),
-			"resetAt":   usageResetTimeToNil(acc["CycleEndTime"]),
-			"unlimited": false, "recurring": true,
-		}
-	}
-	for i, acc := range bonuses {
-		quotas[fmt.Sprintf("Bonus Pack %d", i+1)] = map[string]any{
-			"used":      codebuddyNum(acc["CapacityUsedPrecise"], acc["CapacityUsed"]),
-			"total":     codebuddyNum(acc["CapacitySizePrecise"], acc["CapacitySize"]),
-			"resetAt":   usageResetTimeToNil(acc["CycleEndTime"]),
-			"unlimited": false, "recurring": false,
-		}
-	}
-	plan := "CodeBuddy"
-	base := map[string]any{}
-	if len(refills) > 0 {
-		base = refills[0]
-	} else if len(accounts) > 0 {
-		if m, ok := accounts[0].(map[string]any); ok {
-			base = m
-		}
-	}
-	if p, _ := base["PackageName"].(string); p != "" {
-		plan = p
-	} else if p, _ := base["SubProductName"].(string); p != "" {
-		plan = p
-	}
-	return usageResult{plan: plan, quotas: quotas}
-}
-
-// ---------- kiro: codewhisperer getUsageLimits (3 attempts) ----------
 
 const (
 	kiroCwHost            = "https://codewhisperer.us-east-1.amazonaws.com"
