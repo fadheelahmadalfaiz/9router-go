@@ -2103,6 +2103,30 @@
     }
   }
 
+  // Sequential on purpose: every model probe goes through the same account, and
+  // firing 40 of them at once is both rude to the upstream and a good way to
+  // earn a rate limit on the very account being tested.
+  let isTestingAllModels = $state(false)
+  let allModelsTestSummary = $state<{ total: number; passed: number; failed: number } | null>(null)
+
+  async function handleTestAllModels() {
+    if (isTestingAllModels) return
+    const targets = visibleModels.map((model) => model.id)
+    if (targets.length === 0) return
+
+    isTestingAllModels = true
+    allModelsTestSummary = null
+    activeModelTestError = null
+
+    let passed = 0
+    for (const modelId of targets) {
+      await testModel(modelId)
+      if (modelTestStatuses[modelId] === 'ok') passed++
+    }
+    allModelsTestSummary = { total: targets.length, passed, failed: targets.length - passed }
+    isTestingAllModels = false
+  }
+
   async function handleDisableModel(modelId: string) {
     const updated = Array.from(new Set([...disabledModelIds, modelId]))
     disabledModelIds = updated
@@ -3306,6 +3330,22 @@
       <div class="flex gap-2">
         <button
           type="button"
+          onclick={handleTestAllModels}
+          disabled={isTestingAllModels || visibleModels.length === 0}
+          title="Probe every model of this provider, one at a time"
+          class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer disabled:cursor-not-allowed disabled:opacity-60 active:scale-[0.97] bg-surface-2 hover:bg-surface-3 text-text-main border border-border h-7 px-3 text-xs rounded-[8px]"
+        >
+          <span class="material-symbols-outlined text-[18px] {isTestingAllModels ? 'animate-spin' : ''}">
+            {isTestingAllModels ? 'progress_activity' : 'science'}
+          </span>
+          {isTestingAllModels
+            ? 'Testing…'
+            : allModelsTestSummary
+              ? 'Retest All Models'
+              : 'Test All Models'}
+        </button>
+        <button
+          type="button"
           onclick={handleToggleAllModels}
           class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer active:scale-[0.97] bg-surface-2 hover:bg-surface-3 text-text-main border border-border h-7 px-3 text-xs rounded-[8px]"
         >
@@ -3314,6 +3354,21 @@
         </button>
       </div>
     </div>
+
+    {#if allModelsTestSummary}
+      <div
+        class="mb-3 rounded-lg border p-3 text-xs {allModelsTestSummary.failed > 0
+          ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+          : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'}"
+        role="status"
+        aria-live="polite"
+      >
+        {allModelsTestSummary.passed}/{allModelsTestSummary.total} models reachable
+        {#if allModelsTestSummary.failed > 0}
+          · {allModelsTestSummary.failed} failed
+        {/if}
+      </div>
+    {/if}
 
     {#if activeModelTestError}
       <div class="mb-3 flex items-start gap-2.5 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-600 dark:text-red-400">

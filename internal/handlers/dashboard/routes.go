@@ -38,6 +38,7 @@ func RegisterRoutes(r chi.Router, h *DashboardHandler) {
 		r.Delete("/providers/{id}", h.HandleDeleteConnection)
 		r.Post("/connections/{id}/test", h.HandleTestConnection)
 		r.Post("/providers/{id}/test", h.HandleTestConnection)
+		r.Post("/providers/test-batch", h.HandleTestBatch)
 		r.Get("/providers/{id}/models", h.HandleGetConnectionModels)
 		r.Post("/providers/validate", h.HandleValidateProvider)
 

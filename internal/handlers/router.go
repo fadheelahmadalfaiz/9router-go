@@ -158,6 +158,10 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	r.Post("/api/connections/{id}/reorder", dashH.HandleReorderConnection)
 	r.Post("/api/providers/{id}/reorder", dashH.HandleReorderConnection)
 	r.Post("/api/providers/{id}/test", dashH.HandleTestConnection)
+	// Batch provider probe behind the overview page's "Test All" buttons
+	// (upstream src/app/api/providers/test-batch). Dashboard group only, like
+	// every other /api/providers read the SPA makes with a session cookie.
+	r.Post("/api/providers/test-batch", dashH.HandleTestBatch)
 	r.Get("/api/providers/suggested-models", HandleSuggestedModels)
 	// Usage & Quota Endpoints (dashboard quota tracker, usage stats, and topology stream)
 	r.Get("/api/usage/stream", HandleUsageStream(repo))

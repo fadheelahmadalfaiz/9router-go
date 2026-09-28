@@ -457,3 +457,52 @@ func TestSetupServerRouter_UsageChartAndLogsNotInAPIGroupOnly(t *testing.T) {
 		})
 	}
 }
+
+// TestSetupServerRouter_ProviderTestBatchIsADashboardRead exercises the batch
+// probe through the production router rather than the dashboard package's own
+// RegisterRoutes, which is test-only. The two tables are maintained separately,
+// and that is how a route can exist for tests while 404ing in the binary — the
+// same class of bug that hit /api/cli-tools/all-statuses.
+func TestSetupServerRouter_ProviderTestBatchIsADashboardRead(t *testing.T) {
+	t.Setenv("JWT_SECRET", "router-test-secret")
+
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	repo := db.NewRepo(database)
+	r := chi.NewRouter()
+	SetupServerRouter(r, repo, nil)
+
+	body := strings.NewReader(`{"mode":"all"}`)
+
+	// requireLogin defaults to on with no settings row, so anonymous is denied.
+	anonRec := httptest.NewRecorder()
+	r.ServeHTTP(anonRec, httptest.NewRequest(http.MethodPost, "/api/providers/test-batch", body))
+	if anonRec.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous /api/providers/test-batch status = %d, want 401: %s", anonRec.Code, anonRec.Body.String())
+	}
+
+	token, err := auth.Sign("router-test-secret", time.Now())
+	if err != nil {
+		t.Fatalf("sign session token: %v", err)
+	}
+	sess := httptest.NewRequest(http.MethodPost, "/api/providers/test-batch", strings.NewReader(`{"mode":"all"}`))
+	sess.Header.Set("Content-Type", "application/json")
+	sess.AddCookie(&http.Cookie{Name: auth.CookieName, Value: token})
+	sessRec := httptest.NewRecorder()
+	r.ServeHTTP(sessRec, sess)
+	if sessRec.Code != http.StatusOK {
+		t.Fatalf("session /api/providers/test-batch status = %d, want 200 (not 404, not auth 401): %s", sessRec.Code, sessRec.Body.String())
+	}
+
+	// A missing mode is a client error, which proves the route reached the
+	// handler rather than falling through to the index.html SPA fallback.
+	badRec := httptest.NewRecorder()
+	bad := httptest.NewRequest(http.MethodPost, "/api/providers/test-batch", strings.NewReader(`{}`))
+	bad.Header.Set("Content-Type", "application/json")
+	bad.AddCookie(&http.Cookie{Name: auth.CookieName, Value: token})
+	r.ServeHTTP(badRec, bad)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("missing mode status = %d, want 400 (route may not be registered): %s", badRec.Code, badRec.Body.String())
+	}
+}

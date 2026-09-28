@@ -201,6 +201,36 @@ export interface UsageChartPoint {
   requests: number
 }
 
+/** Which slice of connections POST /api/providers/test-batch should probe. */
+export type BatchTestMode = 'provider' | 'oauth' | 'free' | 'apikey' | 'compatible' | 'all'
+
+export interface BatchTestResult {
+  provider: string
+  connectionId: string
+  connectionName: string
+  authType: string
+  authGroup: string
+  valid: boolean
+  latencyMs: number
+  refreshed: boolean
+  error: string | null
+  testedAt: string
+}
+
+export interface BatchTestSummary {
+  total: number
+  passed: number
+  failed: number
+}
+
+export interface BatchTestResponse {
+  mode: BatchTestMode
+  providerId: string | null
+  results: BatchTestResult[]
+  summary: BatchTestSummary
+  testedAt: string
+}
+
 
 export interface SystemVersionInfo {
   currentVersion: string
@@ -671,6 +701,11 @@ export const api = {
     request<{ ok: boolean; error?: string }>('/api/models/test', {
       method: 'POST',
       body: JSON.stringify({ model }),
+    }),
+  testBatch: (payload: { mode: BatchTestMode; providerId?: string; providerIds?: string[] }) =>
+    request<BatchTestResponse>('/api/providers/test-batch', {
+      method: 'POST',
+      body: JSON.stringify(payload),
     }),
 
   // Settings

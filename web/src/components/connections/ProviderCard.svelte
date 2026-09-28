@@ -14,6 +14,10 @@
     noAuth?: boolean
     onClick: () => void
     onToggleAll?: (active: boolean) => void
+    /** Probes every account of this one provider. Optional so callers that
+     *  do not track a run can leave it unset. */
+    onTest?: () => void
+    isTesting?: boolean
   }
 
   let {
@@ -24,6 +28,8 @@
     noAuth = false,
     onClick,
     onToggleAll,
+    onTest,
+    isTesting = false,
   }: Props = $props()
 
   let isAllDisabled = $derived(stats.allDisabled)
@@ -94,6 +100,35 @@
       </div>
 
       <div class="flex shrink-0 items-center gap-2">
+        {#if onTest && stats.total > 0}
+          <div
+            onclick={(e) => {
+              e.stopPropagation()
+              onTest?.()
+            }}
+            onkeydown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.stopPropagation()
+                onTest?.()
+              }
+            }}
+            role="button"
+            tabindex="0"
+            aria-label={`Test all ${name} connections`}
+            title={`Test all ${name} connections`}
+            class="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity"
+            class:cursor-wait={isTesting}
+            class:cursor-pointer={!isTesting}
+          >
+            <span
+              class="material-symbols-outlined text-[18px] {isTesting
+                ? 'animate-spin text-primary'
+                : 'text-text-muted hover:text-primary'}"
+            >
+              {isTesting ? 'progress_activity' : 'science'}
+            </span>
+          </div>
+        {/if}
         {#if stats.total > 0}
           <div
             class="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity"
