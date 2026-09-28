@@ -28,11 +28,21 @@ on:
 
 permissions:
   contents: write
-  # Upstream regularly touches CI and release definitions, so a merge that
-  # updates anything under .github/workflows/ is rejected by the remote with
-  # "refusing to allow a GitHub App to create or update workflow ... without
-  # `workflows` permission". Granting it here is what makes the merge pushable.
-  workflows: write
+
+# NOTE on workflow-file permissions
+# ---------------------------------
+# A merge that updates anything under .github/workflows/ is rejected by the
+# remote with:
+#   refusing to allow a GitHub App to create or update workflow
+#   `.github/workflows/ci.yml` without `workflows` permission
+#
+# `workflows` is not a key the `permissions:` block accepts, so the grant has
+# to live at the repository level instead. This workflow therefore depends on:
+#   Settings -> Actions -> General -> Workflow permissions
+#     -> "Read and write permissions"
+#   (API: PATCH /repos/{owner}/{repo}/actions/permissions/workflow
+#         {"default_workflow_permissions": "write"})
+# Without it, every scheduled sync that pulls a CI change fails on push.
 
 concurrency:
   group: sync-upstream
