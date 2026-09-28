@@ -28,32 +28,9 @@
   import RequestDetailsTab from './RequestDetailsTab.svelte'
   import RequestLogsView from './RequestLogsView.svelte'
   import ProviderTopologyCard from './ProviderTopologyCard.svelte'
-  import type { Component } from 'svelte'
-  import type { UsageChartPoint } from '../../api/client'
-
-  // The chart library is a large dependency and this view is one tab out of
-  // many, so the three charts load only when the overview actually renders.
-  // Importing them statically charged every dashboard page for them.
-  type ChartModules = {
-    Usage: Component<{ period: Period }>
-    Provider: Component<{ byProvider?: StatsData['byProvider'] }>
-    Top: Component<{ byModel?: StatsData['byModel'] }>
-  }
-
-  let charts = $state<ChartModules | null>(null)
-
-  onMount(async () => {
-    const [usage, provider, top] = await Promise.all([
-      import('./charts/UsageChart.svelte'),
-      import('./charts/ProviderBarChart.svelte'),
-      import('./charts/TopModelsChart.svelte'),
-    ])
-    charts = {
-      Usage: usage.default as ChartModules['Usage'],
-      Provider: provider.default as ChartModules['Provider'],
-      Top: top.default as ChartModules['Top'],
-    }
-  })
+  import UsageChart from './charts/UsageChart.svelte'
+  import ProviderBarChart from './charts/ProviderBarChart.svelte'
+  import TopModelsChart from './charts/TopModelsChart.svelte'
   interface Props {
     connections?: ProviderConnection[]
     providerNodes?: ProviderNode[]
@@ -387,16 +364,14 @@
     </div>
 
     <!-- Token / cost time series, synced to the selected period -->
-    {#if charts}
-      <charts.Usage {period} />
+    <UsageChart {period} />
 
-      <!-- Provider and model breakdown charts -->
-      {#if stats.byProvider || stats.byModel}
-        <div class="grid min-w-0 grid-cols-1 gap-2 lg:grid-cols-2">
-          <charts.Provider byProvider={stats.byProvider} />
-          <charts.Top byModel={stats.byModel} />
-        </div>
-      {/if}
+    <!-- Provider and model breakdown charts -->
+    {#if stats.byProvider || stats.byModel}
+      <div class="grid min-w-0 grid-cols-1 gap-2 lg:grid-cols-2">
+        <ProviderBarChart byProvider={stats.byProvider} />
+        <TopModelsChart byModel={stats.byModel} />
+      </div>
     {/if}
 
     <!-- Breakdown Table -->
