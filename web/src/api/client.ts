@@ -193,6 +193,14 @@ export interface ProviderNode {
   updatedAt?: string
 }
 
+/** One bucket of /api/usage/chart. Mirrors the upstream chart contract. */
+export interface UsageChartPoint {
+  label: string
+  tokens: number
+  cost: number
+  requests: number
+}
+
 
 export interface SystemVersionInfo {
   currentVersion: string
@@ -871,6 +879,9 @@ export const api = {
 
   // Usage & Telemetry
   getUsageStats: (period = 'today') => request<any>(`/api/usage/stats?period=${encodeURIComponent(period)}`),
+  getUsageChart: (period = '7d') =>
+    request<UsageChartPoint[]>(`/api/usage/chart?period=${encodeURIComponent(period)}`),
+  getUsageRequestLogs: (limit = 200) => request<string[]>(`/api/usage/request-logs?limit=${limit}`),
   getRequestDetails: (limit = 50, offset = 0) =>
     request<any>(`/api/usage/request-details?limit=${limit}&offset=${offset}`),
   resetHealth: (provider: string, model?: string) =>

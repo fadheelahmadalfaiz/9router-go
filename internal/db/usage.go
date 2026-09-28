@@ -134,6 +134,48 @@ func (r *Repo) GetUsageDailyRecent(limit int) ([]string, error) {
 	return res, nil
 }
 
+// UsageDailyRow pairs a usageDaily date key with its aggregated JSON payload.
+type UsageDailyRow struct {
+	DateKey string
+	Data    string
+}
+
+// GetUsageDailyWithKeys returns the most recent daily records oldest-first, each
+// with its date key. A limit of zero or less means "every day on record".
+//
+// GetUsageDailyRecent cannot serve a time series: it drops the date key and
+// returns newest-first, and the chart needs both the key (to build a labelled
+// axis) and chronological order. The most recent N rows are selected and then
+// reversed, so "last 7 days" keeps the newest window rather than the oldest.
+func (r *Repo) GetUsageDailyWithKeys(limit int) ([]UsageDailyRow, error) {
+	query := `SELECT dateKey, data FROM usageDaily ORDER BY dateKey DESC`
+	args := []any{}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query usageDaily with keys: %w", err)
+	}
+	defer rows.Close()
+
+	var res []UsageDailyRow
+	for rows.Next() {
+		var row UsageDailyRow
+		if err := rows.Scan(&row.DateKey, &row.Data); err != nil {
+			continue
+		}
+		res = append(res, row)
+	}
+
+	for i, j := 0, len(res)-1; i < j; i, j = i+1, j-1 {
+		res[i], res[j] = res[j], res[i]
+	}
+	return res, nil
+}
+
 // GetUsageHistorySince returns usage history records since the cutoff timestamp.
 func (r *Repo) GetUsageHistorySince(cutoff string) ([]UsageHistoryRow, error) {
 	rows, err := r.db.Query(`

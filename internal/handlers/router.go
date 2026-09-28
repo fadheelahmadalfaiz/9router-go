@@ -166,6 +166,13 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	r.Get("/usage/stats", HandleUsageStats(repo))
 	r.Get("/api/usage/request-details", HandleRequestDetails(repo))
 	r.Get("/api/usage/providers", dashH.HandleGetUsageProviders)
+	// Chart + request logs for the dashboard usage page. Registered only in the
+	// dashboard group (RequireDashboardAuth) on purpose: the SPA calls these
+	// with a session cookie and never an LLM API key, and the API-key group
+	// rejects a cookie outright. Same reasoning as
+	// /api/cli-tools/all-statuses, and the reason that route 401'd once before.
+	r.Get("/api/usage/chart", HandleUsageChart(repo))
+	r.Get("/api/usage/request-logs", HandleUsageRequestLogs(repo))
 	r.Get("/api/usage/{connectionId}", dashH.HandleGetConnectionUsage)
 
 	r.Get("/api/provider-nodes", dashH.HandleGetProviderNodes)

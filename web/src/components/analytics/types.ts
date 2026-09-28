@@ -1,7 +1,8 @@
-export type MainTab = 'overview' | 'details'
-export type Period = 'today' | '24h' | '7d' | '30d' | '60d'
+export type MainTab = 'overview' | 'details' | 'logs'
+export type Period = 'today' | '24h' | '7d' | '30d' | '60d' | 'all'
 export type TableView = 'model' | 'account' | 'apiKey' | 'endpoint'
 export type ViewMode = 'costs' | 'tokens'
+export type SortOrder = 'asc' | 'desc'
 
 export interface UsageItem {
   requests?: number
@@ -15,6 +16,7 @@ export interface UsageItem {
   keyName?: string
   endpoint?: string
   provider?: string
+  connectionId?: string
   key?: string
 }
 
@@ -54,6 +56,11 @@ export interface RequestDetailItem {
   [key: string]: unknown
 }
 
+export interface PendingState {
+  byModel?: Record<string, number>
+  byAccount?: Record<string, Record<string, number>>
+}
+
 export interface StatsData {
   totalRequests?: number
   totalPromptTokens?: number
@@ -68,7 +75,7 @@ export interface StatsData {
   activeRequests?: ActiveRequestItem[]
   recentRequests?: RecentRequestItem[]
   errorProvider?: string
-  pending?: unknown
+  pending?: PendingState
 }
 
 export const PERIODS: { value: Period; label: string }[] = [
@@ -77,6 +84,7 @@ export const PERIODS: { value: Period; label: string }[] = [
   { value: '7d', label: '7D' },
   { value: '30d', label: '30D' },
   { value: '60d', label: '60D' },
+  { value: 'all', label: 'All' },
 ]
 
 export const TABLE_OPTIONS: { value: TableView; label: string }[] = [

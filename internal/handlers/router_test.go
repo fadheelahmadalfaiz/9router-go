@@ -372,3 +372,88 @@ func TestSetupServerRouter_CLIToolsStatusAPIKeyAliasUnchanged(t *testing.T) {
 		t.Fatal("/cli-tools/all-statuses disappeared; it must stay registered on the API-key group")
 	}
 }
+
+// TestSetupServerRouter_UsageChartAndLogsAreDashboardReads pins that the two
+// usage-page endpoints sit behind RequireDashboardAuth. The SPA calls them with
+// the session cookie and never an LLM API key, so a registration inside
+// SetupRoutes (the RequireApiKey group) would 401 exactly like
+// /api/cli-tools/all-statuses once did.
+//
+// This also settles whether the pre-existing usage routes are reachable with a
+// cookie at all: they are registered in both groups, and the API-key group is
+// mounted first, so if chi routed a duplicate pattern to the first registration
+// then /api/usage/stats would already be returning 401 for the dashboard.
+func TestSetupServerRouter_UsageChartAndLogsAreDashboardReads(t *testing.T) {
+	t.Setenv("JWT_SECRET", "router-test-secret")
+
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	repo := db.NewRepo(database)
+	r := chi.NewRouter()
+	SetupServerRouter(r, repo, nil)
+
+	token, err := auth.Sign("router-test-secret", time.Now())
+	if err != nil {
+		t.Fatalf("sign session token: %v", err)
+	}
+
+	paths := []string{
+		"/api/usage/chart?period=7d",
+		"/api/usage/request-logs",
+		// Pre-existing routes, included to catch route shadowing by the
+		// API-key group, which is mounted before the dashboard group.
+		"/api/usage/stats?period=7d",
+		"/api/usage/request-details?limit=5",
+	}
+
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			// requireLogin defaults to on with no settings row.
+			anonRec := httptest.NewRecorder()
+			r.ServeHTTP(anonRec, httptest.NewRequest(http.MethodGet, path, nil))
+			if anonRec.Code != http.StatusUnauthorized {
+				t.Fatalf("anonymous %s status = %d, want 401: %s", path, anonRec.Code, anonRec.Body.String())
+			}
+
+			sess := httptest.NewRequest(http.MethodGet, path, nil)
+			sess.AddCookie(&http.Cookie{Name: auth.CookieName, Value: token})
+			sessRec := httptest.NewRecorder()
+			r.ServeHTTP(sessRec, sess)
+			if sessRec.Code != http.StatusOK {
+				t.Fatalf("session-authenticated %s status = %d, want 200 (not auth 401): %s", path, sessRec.Code, sessRec.Body.String())
+			}
+		})
+	}
+}
+
+// TestSetupServerRouter_UsageChartAndLogsRejectAPIGroupOnly — a valid LLM API
+// key must still be refused when login is required and no session is present,
+// which is what RequireDashboardAuth does. This guards against "fixing" the 401
+// by moving these routes back into SetupRoutes.
+func TestSetupServerRouter_UsageChartAndLogsNotInAPIGroupOnly(t *testing.T) {
+	t.Setenv("JWT_SECRET", "router-test-secret")
+
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	repo := db.NewRepo(database)
+	r := chi.NewRouter()
+	SetupServerRouter(r, repo, nil)
+
+	if _, err := database.Exec(`INSERT INTO apiKeys (id, key, name, isActive, createdAt) VALUES ('usage-test', 'test-api-key', 'test', 1, '2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("seed key: %v", err)
+	}
+
+	for _, path := range []string{"/api/usage/chart?period=7d", "/api/usage/request-logs"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.Header.Set("Authorization", "Bearer test-api-key")
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			if rec.Code == http.StatusNotFound {
+				t.Fatalf("%s is not registered at all", path)
+			}
+		})
+	}
+}

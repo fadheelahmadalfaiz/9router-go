@@ -1,7 +1,7 @@
 <script lang="ts">
+  import { onMount } from 'svelte'
   import { api, getAuthHeaders, type ProviderConnection, type ProviderNode } from '../../api/client'
-  import { PROVIDER_CATALOG } from '../../lib/providers'
-  import Card from '../../lib/ui/Card.svelte'
+  import { pathToTab } from '../../lib/router'
   import {
     fmt,
     timeAgo,
@@ -10,13 +10,50 @@
     type Period,
     type StatsData,
     type RequestDetailItem,
-    type ActiveRequestItem,
-    type RecentRequestItem
+    type SortOrder,
+    type TableView,
+    type ViewMode,
+    type ActiveRequestItem
   } from './types'
+  import {
+    USAGE_URL_DEFAULTS,
+    buildUsageUrl,
+    parseUsageUrlState,
+    type UsageUrlState,
+  } from './urlState'
+  import { buildTopologyProviders, type TopologyProvider } from './topology'
   import SummaryKpiCards from './SummaryKpiCards.svelte'
+  import RecentRequestsCard from './RecentRequestsCard.svelte'
   import UsageBreakdownTable from './UsageBreakdownTable.svelte'
   import RequestDetailsTab from './RequestDetailsTab.svelte'
+  import RequestLogsView from './RequestLogsView.svelte'
   import ProviderTopologyCard from './ProviderTopologyCard.svelte'
+  import type { Component } from 'svelte'
+  import type { UsageChartPoint } from '../../api/client'
+
+  // The chart library is a large dependency and this view is one tab out of
+  // many, so the three charts load only when the overview actually renders.
+  // Importing them statically charged every dashboard page for them.
+  type ChartModules = {
+    Usage: Component<{ period: Period }>
+    Provider: Component<{ byProvider?: StatsData['byProvider'] }>
+    Top: Component<{ byModel?: StatsData['byModel'] }>
+  }
+
+  let charts = $state<ChartModules | null>(null)
+
+  onMount(async () => {
+    const [usage, provider, top] = await Promise.all([
+      import('./charts/UsageChart.svelte'),
+      import('./charts/ProviderBarChart.svelte'),
+      import('./charts/TopModelsChart.svelte'),
+    ])
+    charts = {
+      Usage: usage.default as ChartModules['Usage'],
+      Provider: provider.default as ChartModules['Provider'],
+      Top: top.default as ChartModules['Top'],
+    }
+  })
   interface Props {
     connections?: ProviderConnection[]
     providerNodes?: ProviderNode[]
@@ -24,8 +61,18 @@
 
   let { connections = [], providerNodes = [] }: Props = $props()
 
-  let activeTab = $state<MainTab>('overview')
-  let period = $state<Period>('today')
+  // Tab, period, table view and sort order live in the query string, so a
+  // reload, a shared link and back/forward all restore the same view. Parsing
+  // happens at component init, before the first fetch, so the initial request
+  // already uses the URL's period.
+  const initialUrlState: UsageUrlState =
+    typeof window !== 'undefined' ? parseUsageUrlState(window.location.search) : USAGE_URL_DEFAULTS
+  let activeTab = $state<MainTab>(initialUrlState.tab)
+  let period = $state<Period>(initialUrlState.period)
+  let tableView = $state<TableView>(initialUrlState.table)
+  let viewMode = $state<ViewMode>(initialUrlState.view)
+  let sortBy = $state(initialUrlState.sortBy)
+  let sortOrder = $state<SortOrder>(initialUrlState.sortOrder)
   let isFetching = $state(false)
   let stats = $state<StatsData>({})
   let activeRequests = $state<ActiveRequestItem[]>([])
@@ -222,110 +269,81 @@
       clearInterval(pollTimer)
     }
   })
-  let nodeNameById = $derived.by(() => {
-    const m = new Map<string, string>()
-    for (const n of providerNodes || []) {
-      if (n?.id && n?.name) m.set(n.id, n.name)
-    }
-    return m
-  })
 
-  function topologyName(providerId: string, fallbackName?: string): string {
-    const nodeName = nodeNameById.get(providerId)
-    if (nodeName) return nodeName
-    const cat = PROVIDER_CATALOG.find((p) => p.id === providerId || p.alias === providerId)
-    if (cat?.name) return cat.name
-    if (fallbackName && fallbackName !== providerId) {
-      // Numeric key names (e.g. "12") are connection labels, not provider names —
-      // fall back to the raw provider id so custom nodes never render as "12".
-      if (!/^\d+$/.test(fallbackName.trim())) return fallbackName
-      return providerId
-    }
-    return providerId
+  // Back/forward across filter changes: App.svelte only re-reads the pathname,
+  // so the query string is applied here.
+  onMount(() => {
+    window.addEventListener('popstate', restoreUrlState)
+    return () => window.removeEventListener('popstate', restoreUrlState)
+  })
+  let topologyProviders = $derived.by<TopologyProvider[]>(() =>
+    buildTopologyProviders({
+      connections,
+      providerNodes,
+      activeRequests,
+      recentRequests: stats.recentRequests || [],
+      pulseProvider,
+      lastProvider,
+      errorProvider,
+      byProvider: stats.byProvider,
+    }),
+  )
+
+  // ─── URL state sync ────────────────────────────────────────────────────────
+  function syncUrl(nextState: UsageUrlState): void {
+    if (typeof window === 'undefined') return
+    // Only ever touch the analytics route; other tabs own their own URLs.
+    if (pathToTab(window.location.pathname) !== 'analytics') return
+
+    const search = buildUsageUrl(nextState, window.location.search)
+    if (search === window.location.search) return
+
+    const url = `${window.location.pathname}${search}`
+    window.history.replaceState({ tab: 'analytics', usage: nextState }, '', url)
   }
 
-  let topologyProviders = $derived.by(() => {
-    const seen = new Set<string>()
-    const list: { id: string; alias?: string; name: string; color?: string; type: string }[] = []
-
-    const addProvider = (provId: string, type: string, customName?: string) => {
-      if (!provId) return
-      const canonical = provId.toLowerCase().trim()
-      const cat = PROVIDER_CATALOG.find((p) => p.id.toLowerCase() === canonical || (p.alias && p.alias.toLowerCase() === canonical))
-      const targetId = cat?.id || canonical
-      if (seen.has(targetId)) return
-      seen.add(targetId)
-      if (cat?.alias) seen.add(cat.alias.toLowerCase())
-      seen.add(canonical)
-
-      list.push({
-        id: targetId,
-        alias: cat?.alias,
-        name: topologyName(targetId, customName),
-        color: cat?.color || '#3B82F6',
-        type
-      })
-    }
-
-    // 1. Prioritize active & live providers so lines to models in use never get dropped
-    for (const r of activeRequests) {
-      if (r.provider) addProvider(r.provider, 'active')
-    }
-    if (pulseProvider) addProvider(pulseProvider, 'active')
-    if (lastProvider) addProvider(lastProvider, 'recent')
-    if (errorProvider) addProvider(errorProvider, 'error')
-
-    // 2. Add recent requests
-    for (const r of stats.recentRequests || []) {
-      if (r.provider) addProvider(r.provider, 'recent')
-    }
-
-    // 3. Add active user-configured connections
-    for (const c of connections) {
-      if (c.isActive !== 0 && c.provider) {
-        addProvider(c.provider, 'connection', c.name || undefined)
-      }
-    }
-
-    // 4. Add historical providers with usage
-    if (stats.byProvider) {
-      for (const prov of Object.keys(stats.byProvider)) {
-        addProvider(prov, 'stats')
-      }
-    }
-
-    // 5. Ensure core free/no-auth defaults are present
-    const FREE_DEFAULTS = ['antigravity', 'opencode', 'nvidia', 'openrouter', 'clinepass']
-    for (const f of FREE_DEFAULTS) {
-      addProvider(f, 'default')
-    }
-
-    return list
+  $effect(() => {
+    syncUrl({ tab: activeTab, period, table: tableView, view: viewMode, sortBy, sortOrder })
   })
+
+  function restoreUrlState(): void {
+    const restored = parseUsageUrlState(window.location.search)
+    activeTab = restored.tab
+    period = restored.period
+    tableView = restored.table
+    viewMode = restored.view
+    sortBy = restored.sortBy
+    sortOrder = restored.sortOrder
+  }
+
+  function handleTabChange(tab: MainTab): void {
+    activeTab = tab
+  }
+
+  function handleSortChange(nextSortBy: string, nextSortOrder: SortOrder): void {
+    sortBy = nextSortBy
+    sortOrder = nextSortOrder
+  }
 </script>
 
 <div class="flex min-w-0 flex-col gap-6 px-1 sm:px-0">
   <!-- Tabs + Period Selector Row -->
   <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-    <div class="inline-flex rounded-xl bg-surface border border-border p-1 shadow-sm">
-      <button
-        type="button"
-        onclick={() => (activeTab = 'overview')}
-        class="rounded-lg px-4 py-1.5 text-xs sm:text-sm font-medium transition-colors cursor-pointer {activeTab === 'overview'
-          ? 'bg-brand-500 text-white font-semibold shadow-sm'
-          : 'text-text-muted hover:text-text-main'}"
-      >
-        Overview
-      </button>
-      <button
-        type="button"
-        onclick={() => (activeTab = 'details')}
-        class="rounded-lg px-4 py-1.5 text-xs sm:text-sm font-medium transition-colors cursor-pointer {activeTab === 'details'
-          ? 'bg-brand-500 text-white font-semibold shadow-sm'
-          : 'text-text-muted hover:text-text-main'}"
-      >
-        Details
-      </button>
+    <div class="inline-flex rounded-xl bg-surface border border-border p-1 shadow-sm" role="tablist" aria-label="Usage views">
+      {#each [{ value: 'overview', label: 'Overview' }, { value: 'details', label: 'Details' }, { value: 'logs', label: 'Logs' }] as const as tab (tab.value)}
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === tab.value}
+          onclick={() => handleTabChange(tab.value)}
+          class="rounded-lg px-4 py-1.5 text-xs sm:text-sm font-medium transition-colors cursor-pointer {activeTab ===
+          tab.value
+            ? 'bg-brand-500 text-white font-semibold shadow-sm'
+            : 'text-text-muted hover:text-text-main'}"
+        >
+          {tab.label}
+        </button>
+      {/each}
     </div>
 
     {#if activeTab === 'overview'}
@@ -365,61 +383,34 @@
         {errorProvider}
         onRefresh={() => loadStats(period)}
       />
-      <!-- Recent Requests Card -->
-      <div class="bg-surface border border-border-subtle rounded-[14px] shadow-[var(--shadow-soft)] p-4 flex min-w-0 flex-col overflow-hidden" style="height: 480px">
-        <div class="px-1 py-2 border-b border-border shrink-0">
-          <span class="text-xs font-semibold text-text-muted uppercase tracking-wide">Recent Requests</span>
-        </div>
-
-        {#if !stats.recentRequests || stats.recentRequests.length === 0}
-          <div class="flex-1 flex items-center justify-center text-text-muted text-xs">
-            No requests recorded yet.
-          </div>
-        {:else}
-          <div class="flex-1 overflow-y-auto">
-            <table class="w-full table-fixed min-w-[280px] border-collapse text-xs">
-              <colgroup>
-                <col class="w-[20px]" />
-                <col />
-                <col class="w-[96px]" />
-                <col class="w-[56px]" />
-              </colgroup>
-              <thead class="sticky top-0 bg-bg z-10">
-                <tr class="border-b border-border">
-                  <th class="py-1.5 pl-3 text-left font-semibold text-text-muted"></th>
-                  <th class="py-1.5 text-left font-semibold text-text-muted">Model</th>
-                  <th class="py-1.5 text-right font-semibold text-text-muted whitespace-nowrap">In / Out</th>
-                  <th class="py-1.5 pr-3 text-right font-semibold text-text-muted whitespace-nowrap">When</th>
-                </tr>
-              </thead>
-              <tbody class="divide-y divide-border/50 font-mono text-[11px]">
-                {#each stats.recentRequests as req}
-                  <tr class="hover:bg-bg-subtle transition-colors">
-                    <td class="py-1.5 pl-3 align-middle">
-                      <span class="mx-auto block w-1.5 h-1.5 rounded-full {req.status === 'ok' || req.status === 'success' ? 'bg-success' : 'bg-error'}"></span>
-                    </td>
-                    <td class="py-1.5 pr-2 min-w-0">
-                      <span class="block truncate font-mono text-[11px]" title={req.model}>{req.model}</span>
-                    </td>
-                    <td class="py-1.5 pr-3 text-right whitespace-nowrap">
-                      <span class="text-primary">{fmt(req.promptTokens)}↑</span>
-                      <span class="text-success">{fmt(req.completionTokens)}↓</span>
-                    </td>
-                    <td class="py-1.5 pr-3 text-right text-text-muted whitespace-nowrap text-[10px]">
-                      {timeAgo(req.timestamp)}
-                    </td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-          </div>
-        {/if}
-      </div>
+      <RecentRequestsCard requests={stats.recentRequests || []} />
     </div>
 
+    <!-- Token / cost time series, synced to the selected period -->
+    {#if charts}
+      <charts.Usage {period} />
+
+      <!-- Provider and model breakdown charts -->
+      {#if stats.byProvider || stats.byModel}
+        <div class="grid min-w-0 grid-cols-1 gap-2 lg:grid-cols-2">
+          <charts.Provider byProvider={stats.byProvider} />
+          <charts.Top byModel={stats.byModel} />
+        </div>
+      {/if}
+    {/if}
+
     <!-- Breakdown Table -->
-    <UsageBreakdownTable {stats} />
-  {:else}
+    <UsageBreakdownTable
+      {stats}
+      {tableView}
+      {viewMode}
+      {sortBy}
+      {sortOrder}
+      onTableViewChange={(view) => (tableView = view)}
+      onViewModeChange={(view) => (viewMode = view)}
+      onSortChange={handleSortChange}
+    />
+  {:else if activeTab === 'details'}
     <RequestDetailsTab
       {details}
       {detailsTotal}
@@ -428,5 +419,7 @@
       onPageChange={loadDetails}
       onRefresh={() => loadDetails(detailsPage)}
     />
+  {:else}
+    <RequestLogsView />
   {/if}
 </div>
