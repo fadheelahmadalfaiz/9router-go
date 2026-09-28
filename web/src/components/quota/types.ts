@@ -11,6 +11,7 @@ export const DEPLETED_QUOTA_THRESHOLD = 5
 export const AUTO_REFRESH_STORAGE_KEY = 'quotaAutoRefresh'
 export const ACCOUNT_PAGE_SIZE_OPTIONS = [10, 20, 50, 100]
 export const ACCOUNT_PAGE_SIZE_MAX = 500
+export const DEFAULT_ACCOUNT_PAGE_SIZE = 20
 
 export const ACCOUNT_FILTER_OPTIONS = [
   { value: 'all', label: 'All accounts' },

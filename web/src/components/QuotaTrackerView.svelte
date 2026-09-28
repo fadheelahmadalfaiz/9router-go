@@ -8,6 +8,7 @@
   import { onMount } from 'svelte'
   import { api, type ProviderConnection } from '../api/client'
   import { PROVIDER_CATALOG } from '../lib/providers'
+  import { pathToTab } from '../lib/router'
   import Toggle from '../lib/ui/Toggle.svelte'
   import { getIconPath } from './connections/types'
   import QuotaTable from './quota/QuotaTable.svelte'
@@ -17,6 +18,7 @@
     ACCOUNT_PAGE_SIZE_OPTIONS,
     AUTO_REFRESH_STORAGE_KEY,
     CLAUDE_REFRESH_INTERVAL_MS,
+    DEFAULT_ACCOUNT_PAGE_SIZE,
     DEPLETED_QUOTA_THRESHOLD,
     QUOTA_SORT_OPTIONS,
     REFRESH_INTERVAL_MS,
@@ -42,14 +44,26 @@
     type QuotaVisibility,
     type Totals,
   } from './quota/types'
-
-  const CONNECTIONS_PAGE_SIZE = 20
+  import {
+    QUOTA_URL_DEFAULTS,
+    buildQuotaUrl,
+    getQuotaFilterSignature,
+    parseQuotaUrlState,
+    type QuotaUrlState,
+  } from './quota/urlState'
 
   interface Props {
     connections?: ProviderConnection[]
   }
 
   let { connections: initialConns = [] }: Props = $props()
+
+  // Filters, sort and pagination are seeded from the query string so a reload,
+  // a shared link, or back/forward all restore the same view. Parsing before
+  // onMount keeps the first fetch on the URL's filters (no empty-state flash).
+  const initialUrlState: QuotaUrlState =
+    typeof window !== 'undefined' ? parseQuotaUrlState(window.location.search) : QUOTA_URL_DEFAULTS
+  let lastFilterSignature = getQuotaFilterSignature(initialUrlState)
 
   // ─── State ─────────────────────────────────────────────────────────────────
   let connections = $state<ProviderConnection[]>([])
@@ -67,20 +81,20 @@
   let bulkToggling = $state(false)
 
   // Filters
-  let providerFilter = $state('all')
+  let providerFilter = $state(initialUrlState.provider)
   let providerOptions = $state<string[]>([])
   let providerMenuOpen = $state(false)
-  let accountFilter = $state('all')
-  let quotaSortMode = $state('default')
-  let expiringFirst = $state(false)
+  let accountFilter = $state(initialUrlState.account)
+  let quotaSortMode = $state(initialUrlState.sort)
+  let expiringFirst = $state(initialUrlState.expiring)
 
   // Pagination
-  let page = $state(1)
-  let pageSize = $state(CONNECTIONS_PAGE_SIZE)
-  let customPageSizeInput = $state(String(CONNECTIONS_PAGE_SIZE))
+  let page = $state(initialUrlState.page)
+  let pageSize = $state(initialUrlState.pageSize)
+  let customPageSizeInput = $state(String(initialUrlState.pageSize))
   let pagination = $state<Pagination>({
-    page: 1,
-    pageSize: CONNECTIONS_PAGE_SIZE,
+    page: initialUrlState.page,
+    pageSize: initialUrlState.pageSize,
     total: 0,
     totalPages: 1,
   })
@@ -551,6 +565,53 @@
     void fetchConnections(page)
   })
 
+  // ─── URL state sync ────────────────────────────────────────────────────────
+  // Filters/sort/pagination live in the query string so the view is
+  // refresh-safe, shareable and back/forward aware.
+  function syncUrl(nextState: QuotaUrlState): void {
+    if (typeof window === 'undefined') return
+    // Only ever touch the quota route; other tabs own their own URLs.
+    if (pathToTab(window.location.pathname) !== 'quota') return
+
+    const signature = getQuotaFilterSignature(nextState)
+    const isFilterChange = signature !== lastFilterSignature
+    lastFilterSignature = signature
+
+    const search = buildQuotaUrl(nextState, window.location.search)
+    if (search === window.location.search) return
+
+    const url = `${window.location.pathname}${search}`
+    const snapshot = { tab: 'quota', quota: nextState }
+    if (isFilterChange) {
+      window.history.pushState(snapshot, '', url)
+    } else {
+      window.history.replaceState(snapshot, '', url)
+    }
+  }
+
+  $effect(() => {
+    syncUrl({
+      provider: providerFilter,
+      account: accountFilter,
+      sort: quotaSortMode,
+      expiring: expiringFirst,
+      page,
+      pageSize,
+    })
+  })
+
+  function restoreUrlState(): void {
+    const restored = parseQuotaUrlState(window.location.search)
+    providerFilter = restored.provider
+    accountFilter = restored.account
+    quotaSortMode = restored.sort
+    expiringFirst = restored.expiring
+    page = restored.page
+    pageSize = restored.pageSize
+    customPageSizeInput = String(restored.pageSize)
+    lastFilterSignature = getQuotaFilterSignature(restored)
+  }
+
   onMount(() => {
     // Seed from props to avoid a flash of empty state
     if (initialConns.length > 0 && connections.length === 0) {
@@ -609,10 +670,15 @@
     }
     document.addEventListener('click', handleDocClick)
 
+    // Back/forward across filter changes: App.svelte only re-reads the pathname,
+    // so the query string is applied here.
+    window.addEventListener('popstate', restoreUrlState)
+
     return () => {
       stopTimers()
       document.removeEventListener('visibilitychange', handleVisibilityChange)
       document.removeEventListener('click', handleDocClick)
+      window.removeEventListener('popstate', restoreUrlState)
     }
   })
 
