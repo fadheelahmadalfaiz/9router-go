@@ -28,6 +28,11 @@ on:
 
 permissions:
   contents: write
+  # Upstream regularly touches CI and release definitions, so a merge that
+  # updates anything under .github/workflows/ is rejected by the remote with
+  # "refusing to allow a GitHub App to create or update workflow ... without
+  # `workflows` permission". Granting it here is what makes the merge pushable.
+  workflows: write
 
 concurrency:
   group: sync-upstream
@@ -91,36 +96,64 @@ jobs:
           echo "merged=true" >> "$GITHUB_OUTPUT"
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
-      - name: Verify build after merge
+      - name: Report what the merge brought in
         if: steps.merge.outputs.merged == 'true'
         run: |
-          set -euo pipefail
-          echo "::group::git status"
-          git status --short
+          set -uo pipefail
+          echo "::group::commit"
+          git log -1 --pretty='%h %s'
           echo "::endgroup::"
-          echo "::group::merged files"
-          git diff --stat "HEAD^" HEAD | tail -40
+          echo "::group::files changed by the merge"
+          # HEAD is the merge commit; the diff against its first parent shows
+          # exactly what this sync pulled in.
+          git diff --stat "HEAD^1" HEAD | tail -40
           echo "::endgroup::"
+          # A merge that silently dropped a workflow file is the failure mode
+          # this workflow exists to prevent, so surface it explicitly.
+          CHANGED_WORKFLOWS=$(git diff --name-only "HEAD^1" HEAD -- .github/workflows/ || true)
+          if [ -n "$CHANGED_WORKFLOWS" ]; then
+            echo "::group::workflow files touched by this sync"
+            echo "$CHANGED_WORKFLOWS"
+            echo "::endgroup::"
+          fi
 
       - name: Push to fork
         if: steps.merge.outputs.merged == 'true'
         run: |
-          set -euo pipefail
-          git push origin "HEAD:${{ env.BRANCH }}"
-          echo "Pushed merge to origin/${{ env.BRANCH }}"
+          set -uo pipefail
+          # Someone (a manual commit, the Publish-Image job, or a PR merge) can
+          # land on main between our checkout and this push. Rebase onto the new
+          # tip and retry once instead of failing the whole scheduled run.
+          for ATTEMPT in 1 2 3; do
+            if git push origin "HEAD:${{ env.BRANCH }}"; then
+              echo "Pushed merge to origin/${{ env.BRANCH }} (attempt $ATTEMPT)"
+              exit 0
+            fi
+            echo "::warning::push rejected on attempt $ATTEMPT; rebasing onto the new origin tip"
+            git fetch origin "${{ env.BRANCH }}"
+            # Drop the merge commit, replay only its content on top of origin.
+            git rebase "origin/${{ env.BRANCH }}" || git rebase --abort
+            sleep 5
+          done
+          echo "::error::could not push the merge after 3 attempts"
+          exit 1
 
       - name: Summary
         if: always()
+        env:
+          BEHIND_OUT: ${{ steps.divergence.outputs.behind }}
+          AHEAD_OUT: ${{ steps.divergence.outputs.ahead }}
+          MERGED_OUT: ${{ steps.merge.outputs.merged }}
         run: |
           {
             echo "### Sync Upstream"
             echo ""
             echo "| Field | Value |"
             echo "|-------|-------|"
-            echo "| Upstream | \`${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }}\` |"
-            echo "| Branch | \`${{ env.BRANCH }}\` |"
-            echo "| Behind before sync | ${{ steps.divergence.outputs.behind }} |"
-            echo "| Local commits ahead | ${{ steps.divergence.outputs.ahead }} |"
-            echo "| Merged | ${{ steps.merge.outputs.merged || 'no (already up to date)' }} |"
+            echo "| Upstream | ${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }} |"
+            echo "| Branch | ${{ env.BRANCH }} |"
+            echo "| Behind before sync | $BEHIND_OUT |"
+            echo "| Local commits ahead | $AHEAD_OUT |"
+            echo "| Merged | ${MERGED_OUT:-no (already up to date)} |"
             echo "| Run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |"
           } >> "$GITHUB_STEP_SUMMARY"
