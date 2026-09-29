@@ -1,11 +1,11 @@
 <script lang="ts">
   // Top-5 models by tokens/requests, ported from upstream TopModelsChart.js
-  // (recharts BarChart with layout="vertical" — the horizontal orientation of
-  // LayerChart's BarChart).
-  import { Axis, BarChart, Tooltip } from 'layerchart/svg'
+  // (recharts BarChart with layout="vertical" — the horizontal orientation).
+  // Hand-rolled SVG — see scale.ts for why the LayerChart port was dropped.
   import type { UsageItem } from '../types'
   import ChartFrame from './ChartFrame.svelte'
   import { fmtRequests, fmtTokens, truncateLabel } from './formatters'
+  import { bandScale, linearScale, niceMax } from './scale'
 
   interface Props {
     byModel?: Record<string, UsageItem>
@@ -24,6 +24,10 @@
     requests: { format: fmtRequests, label: 'Requests' },
   }
 
+  const VIEW_W = 420
+  const HEIGHT = 180
+  const PAD = { top: 6, right: 46, bottom: 8, left: 118 }
+
   let viewMode = $state<ViewMode>('tokens')
 
   const config = $derived(VIEW_CONFIG[viewMode])
@@ -41,20 +45,14 @@
       .slice(0, TOP_N),
   )
 
-  // Upstream tints each bar from a palette via recharts <Cell>. LayerChart has
-  // no per-datum fill prop without a categorical color scale, and d3-scale is
-  // only a transitive dependency here, so the bars share one colour instead.
-  const series = $derived([
-    {
-      key: viewMode,
-      value: (row: (typeof chartData)[number]) => row[viewMode],
-      color: BAR_COLOR,
-      props: { radius: 4 },
-    },
-  ])
+  const plotW = VIEW_W - PAD.left - PAD.right
+  const plotH = HEIGHT - PAD.top - PAD.bottom
+  const maxValue = $derived(niceMax(Math.max(0, ...chartData.map((r) => r[viewMode]))))
+  const xScale = $derived(linearScale([0, maxValue], [PAD.left, PAD.left + plotW]))
+  const yBands = $derived(bandScale(chartData.length, [PAD.top, PAD.top + plotH], 0.35))
 </script>
 
-<ChartFrame title="Top Models" empty={chartData.length === 0} emptyMessage="No model usage yet" height={180}>
+<ChartFrame title="Top Models" empty={chartData.length === 0} emptyMessage="No model usage yet" height={HEIGHT}>
   {#snippet controls()}
     <div class="grid grid-cols-2 items-center gap-1 rounded-lg border border-border bg-surface-2 p-1">
       {#each ['tokens', 'requests'] as const as mode (mode)}
@@ -65,50 +63,60 @@
             ? 'bg-primary text-white shadow-sm'
             : 'text-text-muted hover:bg-surface-3 hover:text-text-main'}"
         >
-          {VIEW_CONFIG[mode].label}
+          {mode === 'tokens' ? 'Tokens' : 'Requests'}
         </button>
       {/each}
     </div>
   {/snippet}
 
-  <BarChart
-    data={chartData}
-    x="name"
-    {series}
-    orientation="horizontal"
-    yDomain={[0, null]}
-    yNice
-    padding={{ top: 4, right: 40, left: 4, bottom: 4 }}
-    height={180}
-    bandPadding={0.3}
-    tooltipContext={{ x: 'data' }}
+  <svg
+    viewBox="0 0 {VIEW_W} {HEIGHT}"
+    class="h-full w-full"
+    preserveAspectRatio="none"
+    role="img"
+    aria-label="Top {chartData.length} models by {config.label.toLowerCase()}"
   >
-    <Axis
-      placement="bottom"
-      grid={{ stroke: 'currentColor', opacity: 0.1, dashArray: [3, 3] }}
-      format={config.format}
-      rule={false}
-      tickMarks={false}
-      tickLabelProps={{ fontSize: 10, fill: 'currentColor', fillOpacity: 0.5 }}
-    />
-    <Axis
-      placement="left"
-      rule={false}
-      tickMarks={false}
-      tickLabelProps={{ fontSize: 10, fill: 'currentColor', fillOpacity: 0.7 }}
-    />
-  </BarChart>
+    {#each chartData as row, i (row.fullName)}
+      {@const barTop = yBands.start(i)}
+      <rect
+        x={PAD.left}
+        y={barTop}
+        width={Math.max(1, xScale(row[viewMode]) - PAD.left)}
+        height={yBands.bandWidth}
+        rx="3"
+        fill={BAR_COLOR}
+        fill-opacity="0.85"
+      >
+        <title>{row.fullName}: {config.format(row[viewMode])}</title>
+      </rect>
+      <text
+        x={PAD.left - 8}
+        y={barTop + yBands.bandWidth / 2 + 3}
+        text-anchor="end"
+        font-size="10"
+        fill="currentColor"
+        fill-opacity="0.7"
+      >
+        {row.name}
+      </text>
+      <text
+        x={xScale(row[viewMode]) + 6}
+        y={barTop + yBands.bandWidth / 2 + 3}
+        font-size="10"
+        fill="currentColor"
+        fill-opacity="0.55"
+      >
+        {config.format(row[viewMode])}
+      </text>
+    {/each}
 
-  <Tooltip.Root>
-    {#snippet children({ data: hovered })}
-      {#if hovered}
-        <Tooltip.Header>{hovered.fullName}</Tooltip.Header>
-        <Tooltip.List>
-          <Tooltip.Item label={config.label} format={config.format}>
-            {hovered[viewMode]}
-          </Tooltip.Item>
-        </Tooltip.List>
-      {/if}
-    {/snippet}
-  </Tooltip.Root>
+    <line
+      x1={PAD.left}
+      x2={PAD.left}
+      y1={PAD.top}
+      y2={PAD.top + plotH}
+      stroke="currentColor"
+      stroke-opacity="0.2"
+    />
+  </svg>
 </ChartFrame>

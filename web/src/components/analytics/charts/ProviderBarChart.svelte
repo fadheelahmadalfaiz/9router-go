@@ -1,11 +1,10 @@
 <script lang="ts">
-  // Per-provider token/request breakdown, ported from upstream
-  // ProviderBarChart.js (recharts BarChart, vertical orientation).
-  import { Axis, BarChart, Tooltip } from 'layerchart/svg'
-  import { getIconPath } from '../../connections/types'
+  // ProviderBarChart.js (recharts BarChart, vertical orientation). Hand-rolled
+  // SVG — see scale.ts for why the LayerChart port was dropped.
   import type { UsageItem } from '../types'
   import ChartFrame from './ChartFrame.svelte'
   import { fmtRequests, fmtTokens, truncateLabel } from './formatters'
+  import { bandScale, linearScale, niceMax, niceTicks } from './scale'
 
   interface Props {
     byProvider?: Record<string, UsageItem>
@@ -16,12 +15,17 @@
   type ViewMode = 'tokens' | 'requests'
 
   const BAR_COLOR = '#6366f1'
-  const LABEL_MAX = 10
+  const LABEL_MAX = 18
+  const TOP_N = 10
 
   const VIEW_CONFIG: Record<ViewMode, { format: (n: number) => string; label: string }> = {
     tokens: { format: fmtTokens, label: 'Tokens' },
     requests: { format: fmtRequests, label: 'Requests' },
   }
+
+  const VIEW_W = 420
+  const HEIGHT = 180
+  const PAD = { top: 6, right: 34, bottom: 18, left: 96 }
 
   let viewMode = $state<ViewMode>('tokens')
 
@@ -36,28 +40,19 @@
         requests: item.requests || 0,
       }))
       .filter((row) => row[viewMode] > 0)
-      .sort((a, b) => b[viewMode] - a[viewMode]),
+      .sort((a, b) => b[viewMode] - a[viewMode])
+      .slice(0, TOP_N),
   )
 
-  // Upstream tints each bar from a palette via recharts <Cell>. LayerChart has
-  // no per-datum fill prop without a categorical color scale, and d3-scale is
-  // only a transitive dependency here, so the bars share one colour instead.
-  const series = $derived([
-    {
-      key: viewMode,
-      value: (row: (typeof chartData)[number]) => row[viewMode],
-      color: BAR_COLOR,
-      props: { radius: 4 },
-    },
-  ])
+  const plotW = VIEW_W - PAD.left - PAD.right
+  const plotH = HEIGHT - PAD.top - PAD.bottom
+  const maxValue = $derived(niceMax(Math.max(0, ...chartData.map((r) => r[viewMode]))))
+  const xScale = $derived(linearScale([0, maxValue], [PAD.left, PAD.left + plotW]))
+  const yBands = $derived(bandScale(chartData.length, [PAD.top, PAD.top + plotH], 0.3))
+  const xTicks = $derived(niceTicks(maxValue, 4))
 </script>
 
-<ChartFrame
-  title="By Provider"
-  empty={chartData.length === 0}
-  emptyMessage="No provider usage yet"
-  height={180}
->
+<ChartFrame title="By Provider" empty={chartData.length === 0} emptyMessage="No provider usage yet" height={HEIGHT}>
   {#snippet controls()}
     <div class="grid grid-cols-2 items-center gap-1 rounded-lg border border-border bg-surface-2 p-1">
       {#each ['tokens', 'requests'] as const as mode (mode)}
@@ -68,62 +63,73 @@
             ? 'bg-primary text-white shadow-sm'
             : 'text-text-muted hover:bg-surface-3 hover:text-text-main'}"
         >
-          {VIEW_CONFIG[mode].label}
+          {mode === 'tokens' ? 'Tokens' : 'Requests'}
         </button>
       {/each}
     </div>
   {/snippet}
 
-  <BarChart
-    data={chartData}
-    x="label"
-    {series}
-    orientation="vertical"
-    yDomain={[0, null]}
-    yNice
-    padding={{ top: 4, right: 8, bottom: 4, left: 0 }}
-    height={180}
-    bandPadding={0.3}
-    tooltipContext={{ x: 'data' }}
+  <svg
+    viewBox="0 0 {VIEW_W} {HEIGHT}"
+    class="h-full w-full"
+    preserveAspectRatio="none"
+    role="img"
+    aria-label="{config.label} by provider"
   >
-    <Axis
-      placement="left"
-      grid={{ stroke: 'currentColor', opacity: 0.1, dashArray: [3, 3] }}
-      format={config.format}
-      rule={false}
-      tickMarks={false}
-      tickLabelProps={{ fontSize: 10, fill: 'currentColor', fillOpacity: 0.5 }}
-    />
-    <Axis
-      placement="bottom"
-      rule={false}
-      tickMarks={false}
-      tickLabelProps={{ fontSize: 10, fill: 'currentColor', fillOpacity: 0.6 }}
-    />
-  </BarChart>
+    {#each xTicks as tick (tick)}
+      <line
+        x1={xScale(tick)}
+        x2={xScale(tick)}
+        y1={PAD.top}
+        y2={PAD.top + plotH}
+        stroke="currentColor"
+        stroke-opacity="0.08"
+        stroke-dasharray="3 3"
+      />
+      <text
+        x={xScale(tick)}
+        y={HEIGHT - 5}
+        text-anchor="middle"
+        font-size="9"
+        fill="currentColor"
+        fill-opacity="0.5"
+      >
+        {config.format(tick)}
+      </text>
+    {/each}
 
-  <Tooltip.Root>
-    {#snippet children({ data: hovered })}
-      {#if hovered}
-        <Tooltip.Header>
-          <span class="flex items-center gap-1.5">
-            <img
-              src={getIconPath(hovered.id)}
-              alt={hovered.id}
-              class="size-3.5 rounded-sm object-contain"
-              onerror={(event) => {
-                ;(event.currentTarget as HTMLElement).style.display = 'none'
-              }}
-            />
-            {hovered.id}
-          </span>
-        </Tooltip.Header>
-        <Tooltip.List>
-          <Tooltip.Item label={config.label} format={config.format}>
-            {hovered[viewMode]}
-          </Tooltip.Item>
-        </Tooltip.List>
-      {/if}
-    {/snippet}
-  </Tooltip.Root>
+    {#each chartData as row, i (row.id)}
+      {@const barTop = yBands.start(i)}
+      <rect
+        x={PAD.left}
+        y={barTop}
+        width={Math.max(1, xScale(row[viewMode]) - PAD.left)}
+        height={yBands.bandWidth}
+        rx="3"
+        fill={BAR_COLOR}
+        fill-opacity="0.85"
+      >
+        <title>{row.id}: {config.format(row[viewMode])}</title>
+      </rect>
+      <text
+        x={PAD.left - 8}
+        y={barTop + yBands.bandWidth / 2 + 3}
+        text-anchor="end"
+        font-size="10"
+        fill="currentColor"
+        fill-opacity="0.7"
+      >
+        {row.label}
+      </text>
+    {/each}
+
+    <line
+      x1={PAD.left}
+      x2={PAD.left}
+      y1={PAD.top}
+      y2={PAD.top + plotH}
+      stroke="currentColor"
+      stroke-opacity="0.2"
+    />
+  </svg>
 </ChartFrame>

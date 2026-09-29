@@ -1,13 +1,13 @@
 <script lang="ts">
   // Time-series chart for tokens / requests / cost, ported from upstream
-  // UsageChart.js (recharts AreaChart). LayerChart's AreaChart is the Svelte 5
-  // equivalent and renders SVG, so the gradient, axes and tooltip config map
-  // across one-for-one.
-  import { AreaChart, Axis, Rule, Tooltip } from 'layerchart/svg'
+  // UsageChart.js (recharts AreaChart). Hand-rolled SVG: the LayerChart port
+  // mounted and drew its axes but never emitted the area path, so the card
+  // rendered empty. See scale.ts for why.
   import { api, type UsageChartPoint } from '../../../api/client'
   import type { Period } from '../types'
   import ChartFrame from './ChartFrame.svelte'
   import { fmtCost, fmtRequests, fmtTokens } from './formatters'
+  import { bandScale, linePath, linearScale, niceMax, niceTicks } from './scale'
 
   interface Props {
     period: Period
@@ -23,29 +23,15 @@
     { value: 'cost', label: 'Cost' },
   ]
 
-  const VIEW_CONFIG: Record<
-    ViewMode,
-    { color: string; gradientId: string; format: (n: number) => string; label: string }
-  > = {
-    tokens: {
-      color: '#6366f1',
-      gradientId: 'usage-grad-tokens',
-      format: fmtTokens,
-      label: 'Tokens',
-    },
-    requests: {
-      color: '#14b8a6',
-      gradientId: 'usage-grad-requests',
-      format: fmtRequests,
-      label: 'Requests',
-    },
-    cost: {
-      color: '#f59e0b',
-      gradientId: 'usage-grad-cost',
-      format: fmtCost,
-      label: 'Cost',
-    },
+  const VIEW_CONFIG: Record<ViewMode, { color: string; format: (n: number) => string; label: string }> = {
+    tokens: { color: '#6366f1', format: fmtTokens, label: 'Tokens' },
+    requests: { color: '#14b8a6', format: fmtRequests, label: 'Requests' },
+    cost: { color: '#f59e0b', format: fmtCost, label: 'Cost' },
   }
+
+  const HEIGHT = 220
+  const PAD = { top: 8, right: 10, bottom: 22, left: 46 }
+  const LABEL_EVERY = 7
 
   let viewMode = $state<ViewMode>('tokens')
   let data = $state<UsageChartPoint[]>([])
@@ -54,18 +40,31 @@
 
   const config = $derived(VIEW_CONFIG[viewMode])
   const hasData = $derived(data.some((point) => (point[viewMode] || 0) > 0))
-  const series = $derived([
-    {
-      key: viewMode,
-      value: (point: UsageChartPoint) => point[viewMode] || 0,
-      color: config.color,
-      props: {
-        fill: `url(#${config.gradientId})`,
-        stroke: config.color,
-        line: { strokeWidth: 2 },
-      },
-    },
-  ])
+
+  // Width is fixed rather than measured: a ResizeObserver-driven chart that
+  // starts at 0 and never re-measures is exactly the class of bug this port
+  // already shipped once, and these cards live in a fluid grid where a fixed
+  // viewBox scales cleanly.
+  const VIEW_W = 720
+  const plotW = VIEW_W - PAD.left - PAD.right
+  const plotH = HEIGHT - PAD.top - PAD.bottom
+
+  const maxValue = $derived(niceMax(Math.max(0, ...data.map((p) => p[viewMode] || 0))))
+  const yScale = $derived(linearScale([0, maxValue], [PAD.top + plotH, PAD.top]))
+  const xBands = $derived(bandScale(data.length, [PAD.left, PAD.left + plotW], 0.2))
+  const yTicks = $derived(niceTicks(maxValue, 5))
+
+  const points = $derived(
+    data.map((p, i) => ({ x: xBands.center(i), y: yScale(p[viewMode] || 0) })),
+  )
+  const areaPath = $derived.by(() => {
+    if (points.length === 0) return ''
+    const base = PAD.top + plotH
+    return `${linePath(points)} L ${points[points.length - 1].x.toFixed(2)} ${base} L ${points[0].x.toFixed(2)} ${base} Z`
+  })
+
+  // Only a few x labels fit; a tick per point would overlap into noise.
+  const labelStep = $derived(Math.max(1, Math.ceil(data.length / LABEL_EVERY)))
 
   $effect(() => {
     const target = period
@@ -87,7 +86,7 @@
   })
 </script>
 
-<ChartFrame {loading} empty={!loading && !hasData} height={220}>
+<ChartFrame {loading} empty={!loading && !hasData} height={HEIGHT}>
   {#snippet controls()}
     <div class="grid grid-cols-3 items-center gap-1 rounded-lg border border-border bg-surface-2 p-1">
       {#each VIEW_MODES as mode (mode.value)}
@@ -105,55 +104,79 @@
     </div>
   {/snippet}
 
-  <AreaChart
-    {data}
-    x="label"
-    {series}
-    yDomain={[0, null]}
-    yNice
-    padding={{ top: 4, right: 8, bottom: 0, left: 0 }}
-    height={220}
-    tooltipContext={{ x: 'data' }}
+  <svg
+    viewBox="0 0 {VIEW_W} {HEIGHT}"
+    class="h-full w-full"
+    preserveAspectRatio="none"
+    role="img"
+    aria-label="{config.label} over time"
   >
     <defs>
-      {#each VIEW_MODES as mode (mode.value)}
-        <linearGradient id={VIEW_CONFIG[mode.value].gradientId} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="5%" stop-color={VIEW_CONFIG[mode.value].color} stop-opacity="0.25" />
-          <stop offset="95%" stop-color={VIEW_CONFIG[mode.value].color} stop-opacity="0" />
-        </linearGradient>
-      {/each}
+      <linearGradient id="usage-area-grad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="5%" stop-color={config.color} stop-opacity="0.28" />
+        <stop offset="95%" stop-color={config.color} stop-opacity="0" />
+      </linearGradient>
     </defs>
 
-    <Rule y={0} />
+    <!-- gridlines + y labels -->
+    {#each yTicks as tick (tick)}
+      <line
+        x1={PAD.left}
+        x2={PAD.left + plotW}
+        y1={yScale(tick)}
+        y2={yScale(tick)}
+        stroke="currentColor"
+        stroke-opacity="0.1"
+        stroke-dasharray="3 3"
+      />
+      <text
+        x={PAD.left - 8}
+        y={yScale(tick) + 3}
+        text-anchor="end"
+        font-size="10"
+        fill="currentColor"
+        fill-opacity="0.55"
+      >
+        {config.format(tick)}
+      </text>
+    {/each}
 
-    <Axis
-      placement="left"
-      grid={{ stroke: 'currentColor', opacity: 0.1, dashArray: [3, 3] }}
-      format={config.format}
-      rule={false}
-      tickMarks={false}
-      tickLabelProps={{ fontSize: 10, fill: 'currentColor', fillOpacity: 0.5 }}
-    />
-    <Axis
-      placement="bottom"
-      rule={false}
-      tickMarks={false}
-      tickLabelProps={{ fontSize: 10, fill: 'currentColor', fillOpacity: 0.5 }}
-    />
-  </AreaChart>
-
-  <Tooltip.Root>
-    {#snippet children({ data: hovered })}
-      {#if hovered}
-        <Tooltip.Header>
-          {hovered.label}
-        </Tooltip.Header>
-        <Tooltip.List>
-          <Tooltip.Item label={config.label} color={config.color} format={config.format}>
-            {hovered[viewMode]}
-          </Tooltip.Item>
-        </Tooltip.List>
+    <!-- x labels -->
+    {#each data as point, i (point.label + i)}
+      {#if i % labelStep === 0}
+        <text
+          x={xBands.center(i)}
+          y={HEIGHT - 6}
+          text-anchor="middle"
+          font-size="10"
+          fill="currentColor"
+          fill-opacity="0.55"
+        >
+          {point.label}
+        </text>
       {/if}
-    {/snippet}
-  </Tooltip.Root>
+    {/each}
+
+    <!-- baseline -->
+    <line
+      x1={PAD.left}
+      x2={PAD.left + plotW}
+      y1={PAD.top + plotH}
+      y2={PAD.top + plotH}
+      stroke="currentColor"
+      stroke-opacity="0.2"
+    />
+
+    {#if hasData}
+      <path d={areaPath} fill="url(#usage-area-grad)" stroke="none" />
+      <path
+        d={linePath(points)}
+        fill="none"
+        stroke={config.color}
+        stroke-width="2"
+        stroke-linejoin="round"
+        stroke-linecap="round"
+      />
+    {/if}
+  </svg>
 </ChartFrame>

@@ -11,7 +11,6 @@
   },
   "dependencies": {
     "clsx": "^2.1.1",
-    "layerchart": "^2.5.0",
     "lucide-react": "^1.46.0",
     "marked": "^18.0.14",
     "material-symbols": "^0.47.5",
