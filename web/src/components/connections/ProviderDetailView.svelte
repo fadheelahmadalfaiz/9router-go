@@ -2107,7 +2107,11 @@
   // firing 40 of them at once is both rude to the upstream and a good way to
   // earn a rate limit on the very account being tested.
   let isTestingAllModels = $state(false)
+  let isTestingAllCompatibleModels = $state(false)
   let allModelsTestSummary = $state<{ total: number; passed: number; failed: number } | null>(null)
+  let allCompatibleTestSummary = $state<{ total: number; passed: number; failed: number } | null>(
+    null,
+  )
 
   async function handleTestAllModels() {
     if (isTestingAllModels) return
@@ -2125,6 +2129,27 @@
     }
     allModelsTestSummary = { total: targets.length, passed, failed: targets.length - passed }
     isTestingAllModels = false
+  }
+
+  // Same sweep for a compatible node's own model list, which is the section a
+  // custom provider actually renders — the "Available Models" block above is
+  // hidden for these nodes, so its button is unreachable here.
+  async function handleTestAllCompatibleModels() {
+    if (isTestingAllCompatibleModels) return
+    const targets = compatibleRows.map((row) => row.id)
+    if (targets.length === 0) return
+
+    isTestingAllCompatibleModels = true
+    allCompatibleTestSummary = null
+    activeModelTestError = null
+
+    let passed = 0
+    for (const modelId of targets) {
+      await handleTestCompatibleModel(modelId)
+      if (compatibleTestResults[modelId] === 'ok') passed++
+    }
+    allCompatibleTestSummary = { total: targets.length, passed, failed: targets.length - passed }
+    isTestingAllCompatibleModels = false
   }
 
   async function handleDisableModel(modelId: string) {
@@ -3230,12 +3255,47 @@
           type="button"
           onclick={handleImportCompatibleModels}
           disabled={!canImportCompatible || isImportingCompatibleModels}
-          class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer active:scale-[0.97] bg-surface-2 hover:bg-surface-3 text-text-main border border-border h-8 px-4 text-xs rounded-[8px] disabled:opacity-50 disabled:cursor-not-allowed"
+          class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 active:scale-[0.97] bg-surface-2 hover:bg-surface-3 text-text-main border border-border h-8 px-4 text-xs rounded-[8px]"
         >
           <span class="material-symbols-outlined text-[18px]">download</span>
           {isImportingCompatibleModels ? 'Importing...' : 'Import from /models'}
         </button>
+        <button
+          type="button"
+          onclick={handleTestAllCompatibleModels}
+          disabled={isTestingAllCompatibleModels || compatibleRows.length === 0}
+          title="Probe every model of this provider, one at a time"
+          class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 active:scale-[0.97] bg-surface-2 hover:bg-surface-3 text-text-main border border-border h-8 px-4 text-xs rounded-[8px]"
+        >
+          <span
+            class="material-symbols-outlined text-[18px] {isTestingAllCompatibleModels
+              ? 'animate-spin'
+              : ''}"
+          >
+            {isTestingAllCompatibleModels ? 'progress_activity' : 'science'}
+          </span>
+          {isTestingAllCompatibleModels
+            ? 'Testing…'
+            : allCompatibleTestSummary
+              ? 'Retest All Models'
+              : 'Test All Models'}
+        </button>
       </div>
+      {#if allCompatibleTestSummary}
+        <div
+          class="mb-3 rounded-lg border p-3 text-xs {allCompatibleTestSummary.failed > 0
+            ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+            : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'}"
+          role="status"
+          aria-live="polite"
+        >
+          {allCompatibleTestSummary.passed}/{allCompatibleTestSummary.total} models reachable
+          {#if allCompatibleTestSummary.failed > 0}
+            · {allCompatibleTestSummary.failed} failed
+          {/if}
+        </div>
+      {/if}
+
       {#if !canImportCompatible}
         <p class="text-xs text-text-muted">Add a connection to enable importing models.</p>
       {/if}
