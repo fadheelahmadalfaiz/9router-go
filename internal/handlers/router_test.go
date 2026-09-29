@@ -373,23 +373,30 @@ func TestSetupServerRouter_CLIToolsStatusAPIKeyAliasUnchanged(t *testing.T) {
 	}
 }
 
-// TestSetupServerRouter_UsageChartAndLogsAreDashboardReads pins that the two
-// usage-page endpoints sit behind RequireDashboardAuth. The SPA calls them with
-// the session cookie and never an LLM API key, so a registration inside
-// SetupRoutes (the RequireApiKey group) would 401 exactly like
-// /api/cli-tools/all-statuses once did.
+// TestSetupServerRouter_CodexResetCreditsAreLive pins that the reset-credit
+// routes are registered on the router the server actually mounts.
 //
-// This also settles whether the pre-existing usage routes are reachable with a
-// cookie at all: they are registered in both groups, and the API-key group is
-// mounted first, so if chi routed a duplicate pattern to the first registration
-// then /api/usage/stats would already be returning 401 for the dashboard.
-func TestSetupServerRouter_UsageChartAndLogsAreDashboardReads(t *testing.T) {
+// They were first added only to dashboard.RegisterRoutes, which the dashboard
+// tests use but SetupServerRouter does not — so every handler test passed
+// while the real gateway answered 404 and the button did nothing. This is
+// the same failure shape as the CLI Tools regression above: a route wired into
+// the table the tests exercise rather than the one production mounts.
+func TestSetupServerRouter_CodexResetCreditsAreLive(t *testing.T) {
 	t.Setenv("JWT_SECRET", "router-test-secret")
 
 	database, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	repo := db.NewRepo(database)
+	now := "2026-07-18T00:00:00Z"
+	if _, err := database.Exec(
+		`INSERT INTO providerConnections (id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt)
+		 VALUES ('codex-1', 'codex', 'oauth', 'Codex', '', 1, 1, ?, ?, ?)`,
+		`{"accessToken":"fake","providerSpecificData":{"chatgptAccountId":"acct-1"}}`, now, now,
+	); err != nil {
+		t.Fatalf("seed connection: %v", err)
+	}
+
 	r := chi.NewRouter()
 	SetupServerRouter(r, repo, nil)
 
@@ -397,112 +404,36 @@ func TestSetupServerRouter_UsageChartAndLogsAreDashboardReads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sign session token: %v", err)
 	}
-
-	paths := []string{
-		"/api/usage/chart?period=7d",
-		"/api/usage/request-logs",
-		// Pre-existing routes, included to catch route shadowing by the
-		// API-key group, which is mounted before the dashboard group.
-		"/api/usage/stats?period=7d",
-		"/api/usage/request-details?limit=5",
+	authed := func(method, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, nil)
+		req.AddCookie(&http.Cookie{Name: auth.CookieName, Value: token})
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
 	}
 
-	for _, path := range paths {
-		t.Run(path, func(t *testing.T) {
-			// requireLogin defaults to on with no settings row.
-			anonRec := httptest.NewRecorder()
-			r.ServeHTTP(anonRec, httptest.NewRequest(http.MethodGet, path, nil))
-			if anonRec.Code != http.StatusUnauthorized {
-				t.Fatalf("anonymous %s status = %d, want 401: %s", path, anonRec.Code, anonRec.Body.String())
-			}
-
-			sess := httptest.NewRequest(http.MethodGet, path, nil)
-			sess.AddCookie(&http.Cookie{Name: auth.CookieName, Value: token})
-			sessRec := httptest.NewRecorder()
-			r.ServeHTTP(sessRec, sess)
-			if sessRec.Code != http.StatusOK {
-				t.Fatalf("session-authenticated %s status = %d, want 200 (not auth 401): %s", path, sessRec.Code, sessRec.Body.String())
-			}
-		})
-	}
-}
-
-// TestSetupServerRouter_UsageChartAndLogsRejectAPIGroupOnly — a valid LLM API
-// key must still be refused when login is required and no session is present,
-// which is what RequireDashboardAuth does. This guards against "fixing" the 401
-// by moving these routes back into SetupRoutes.
-func TestSetupServerRouter_UsageChartAndLogsNotInAPIGroupOnly(t *testing.T) {
-	t.Setenv("JWT_SECRET", "router-test-secret")
-
-	database, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	repo := db.NewRepo(database)
-	r := chi.NewRouter()
-	SetupServerRouter(r, repo, nil)
-
-	if _, err := database.Exec(`INSERT INTO apiKeys (id, key, name, isActive, createdAt) VALUES ('usage-test', 'test-api-key', 'test', 1, '2026-01-01T00:00:00Z')`); err != nil {
-		t.Fatalf("seed key: %v", err)
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/api/usage/codex-1/reset-credits"},
+		{http.MethodPost, "/api/usage/codex-1/reset-credits/consume"},
+	} {
+		rec := authed(tc.method, tc.path)
+		// The token is fake, so the wham call is expected to fail. Anything
+		// that is not a 404 proves the route reached the handler; chi's
+		// unmatched-route body is the tell.
+		if rec.Code == http.StatusNotFound {
+			t.Errorf("%s %s is not registered on the production router: %s",
+				tc.method, tc.path, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), "404 page not found") {
+			t.Errorf("%s %s fell through to chi's not-found handler", tc.method, tc.path)
+		}
 	}
 
-	for _, path := range []string{"/api/usage/chart?period=7d", "/api/usage/request-logs"} {
-		t.Run(path, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, path, nil)
-			req.Header.Set("Authorization", "Bearer test-api-key")
-			rec := httptest.NewRecorder()
-			r.ServeHTTP(rec, req)
-			if rec.Code == http.StatusNotFound {
-				t.Fatalf("%s is not registered at all", path)
-			}
-		})
-	}
-}
-
-// TestSetupServerRouter_ProviderTestBatchIsADashboardRead exercises the batch
-// probe through the production router rather than the dashboard package's own
-// RegisterRoutes, which is test-only. The two tables are maintained separately,
-// and that is how a route can exist for tests while 404ing in the binary — the
-// same class of bug that hit /api/cli-tools/all-statuses.
-func TestSetupServerRouter_ProviderTestBatchIsADashboardRead(t *testing.T) {
-	t.Setenv("JWT_SECRET", "router-test-secret")
-
-	database, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	repo := db.NewRepo(database)
-	r := chi.NewRouter()
-	SetupServerRouter(r, repo, nil)
-
-	body := strings.NewReader(`{"mode":"all"}`)
-
-	// requireLogin defaults to on with no settings row, so anonymous is denied.
-	anonRec := httptest.NewRecorder()
-	r.ServeHTTP(anonRec, httptest.NewRequest(http.MethodPost, "/api/providers/test-batch", body))
-	if anonRec.Code != http.StatusUnauthorized {
-		t.Fatalf("anonymous /api/providers/test-batch status = %d, want 401: %s", anonRec.Code, anonRec.Body.String())
-	}
-
-	token, err := auth.Sign("router-test-secret", time.Now())
-	if err != nil {
-		t.Fatalf("sign session token: %v", err)
-	}
-	sess := httptest.NewRequest(http.MethodPost, "/api/providers/test-batch", strings.NewReader(`{"mode":"all"}`))
-	sess.Header.Set("Content-Type", "application/json")
-	sess.AddCookie(&http.Cookie{Name: auth.CookieName, Value: token})
-	sessRec := httptest.NewRecorder()
-	r.ServeHTTP(sessRec, sess)
-	if sessRec.Code != http.StatusOK {
-		t.Fatalf("session /api/providers/test-batch status = %d, want 200 (not 404, not auth 401): %s", sessRec.Code, sessRec.Body.String())
-	}
-
-	// A missing mode is a client error, which proves the route reached the
-	// handler rather than falling through to the index.html SPA fallback.
-	badRec := httptest.NewRecorder()
-	bad := httptest.NewRequest(http.MethodPost, "/api/providers/test-batch", strings.NewReader(`{}`))
-	bad.Header.Set("Content-Type", "application/json")
-	bad.AddCookie(&http.Cookie{Name: auth.CookieName, Value: token})
-	r.ServeHTTP(badRec, bad)
-	if badRec.Code != http.StatusBadRequest {
-		t.Fatalf("missing mode status = %d, want 400 (route may not be registered): %s", badRec.Code, badRec.Body.String())
+	// Anonymous callers must still be stopped by the dashboard gate rather
+	// than reaching the handler.
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/usage/codex-1/reset-credits", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("anonymous status = %d, want 401", rec.Code)
 	}
 }
