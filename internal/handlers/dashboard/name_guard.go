@@ -20,15 +20,12 @@ const (
 //
 // A bare model string the client sends is resolved against a model alias first
 // (resolveModel step 2), then a combo name (step 3), then a provider node
-// prefix. All three are editable from the dashboard, so the same string could
-// be written into two of them: the alias then silently wins over the combo and
-// the combo can no longer be reached by name at all, with nothing but a model
-// name in the failure. A custom model id is reached as "<node-prefix>/<id>",
-// which is a different address, but /v1/models then advertises "combo-wombo"
-// and "xai/combo-wombo" side by side and a name copied out of the list no
-// longer says which one it lands on — the state observed on the xai node,
-// which carried custom model ids "combo-wombo" and "agy" alongside combos of
-// exactly those names.
+// prefix. The alias-vs-combo pair is therefore a real shadow and stays refused.
+// The custom model is a different case: it lives at "<prefix>/<id>", so it does
+// not share an address with the bare name and is allowed to coexist with an
+// alias — see customModelAndAliasMayCoexist. Only the /v1/models listing then
+// carries both "<id>" and "<prefix>/<id>" side by side, which is a naming
+// ambiguity to be aware of, not a target that can no longer be reached.
 //
 // Comparison is exact after trimming, matching resolution itself: resolveModel
 // looks combos up with `WHERE name = ?` and aliases by exact kv key, so
@@ -36,6 +33,25 @@ const (
 // not refuse either. It guards the write only, so rows that already collide
 // keep working — nothing is migrated or hidden.
 //
+// customModelAndAliasMayCoexist reports whether a custom model id and a model
+// alias may hold the same bare name.
+//
+// They may, and did not need to be blocked. A custom model is stored as
+// "<providerAlias>|<id>" and is addressed "<prefix>/<id>" — a different address
+// from the bare "id" the alias key owns. Resolution confirms it: a bare request
+// takes the alias at step 2 (resolveModel), and a prefixed one never reaches
+// the bare-name alias table at all, because resolvePrefixProvider matches the
+// prefix. Neither one hides the other.
+//
+// The pair that genuinely shadows is alias vs combo, and it stays refused: a
+// combo is addressed by its bare name only, so an alias of that name makes the
+// combo unreachable. The custom-model check below is kept for combos for the
+// /v1/models ambiguity reason the original comment described, which is a real
+// but much weaker concern than shadowing.
+func customModelAndAliasMayCoexist(namespace string) bool {
+	return namespace == nsCustomModel || namespace == nsModelAlias
+}
+
 // Returns true when it has already written the 409 and the caller must return.
 func (h *DashboardHandler) guardNameCollision(w http.ResponseWriter, namespace, name string) bool {
 	name = strings.TrimSpace(name)
@@ -52,15 +68,17 @@ func (h *DashboardHandler) guardNameCollision(w http.ResponseWriter, namespace, 
 		}
 	}
 
-	if namespace != nsModelAlias {
+	if namespace != nsModelAlias && !customModelAndAliasMayCoexist(namespace) {
 		if target, err := h.Repo.GetModelAlias(name); err == nil && target != "" {
 			writeNameConflict(w, "MODEL_ALIAS_CONFLICT", name,
-				"a model alias \""+name+"\" already resolves this name, and an alias is consulted before a combo, so the combo would be unreachable")
+				"a model alias \""+name+"\" already resolves this name, and an alias is consulted before a combo, "+
+					"so a combo named \""+name+"\" would be unreachable; rename the "+namespaceLabel(namespace)+
+					" or the alias so the name addresses one target")
 			return true
 		}
 	}
 
-	if namespace != nsCustomModel {
+	if namespace != nsCustomModel && !customModelAndAliasMayCoexist(namespace) {
 		if owner, ok := customModelOwner(h, name); ok {
 			writeNameConflict(w, "CUSTOM_MODEL_NAME_CONFLICT", name,
 				"the custom model \""+owner+"/"+name+"\" already uses this id; rename one of them so the name addresses one target")

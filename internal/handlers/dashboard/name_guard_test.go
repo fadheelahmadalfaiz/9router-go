@@ -130,13 +130,44 @@ func TestGuardNameCollision(t *testing.T) {
 		}
 	})
 
-	t.Run("a model alias matching a custom model id is refused", func(t *testing.T) {
+	// A custom model is addressed "<prefix>/<id>", so it does not share an
+	// address with the bare name an alias key owns. Refusing the pair locked
+	// users out of adding a model to a custom provider whenever an unrelated
+	// alias happened to carry the same name.
+	t.Run("a model alias and a custom model id may share a name", func(t *testing.T) {
 		h, cleanup := seed(t)
 		defer cleanup()
 
 		rec := do(h, http.MethodPut, "/api/models/alias",
 			`{"model":"openai/gpt-4o","alias":"`+aliasName+`"}`)
-		assertRefused(t, rec, "CUSTOM_MODEL_NAME_CONFLICT")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("alias over an existing custom model id: status = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		if target, err := h.Repo.GetModelAlias(aliasName); err != nil || target == "" {
+			t.Fatalf("alias was not written: %q (err %v)", target, err)
+		}
+	})
+
+	t.Run("a custom model id may reuse a name an alias already owns", func(t *testing.T) {
+		h, cleanup := seed(t)
+		defer cleanup()
+
+		// This is the reported case: an alias "glm-5.1" exists (from the shared
+		// database) and the user adds "glm-5.1" to their own custom provider.
+		rec := do(h, http.MethodPut, "/api/models/alias",
+			`{"model":"openai/gpt-4o","alias":"glm-5.1"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("seed alias: status = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+
+		added := do(h, http.MethodPost, "/api/models/custom",
+			`{"key":"node|glm-5.1|llm","value":{"id":"glm-5.1","providerAlias":"node","type":"llm"}}`)
+		if added.Code != http.StatusOK {
+			t.Fatalf("custom model over an existing alias: status = %d, want 200: %s", added.Code, added.Body.String())
+		}
+		if _, err := h.Repo.GetModelAlias("glm-5.1"); err != nil {
+			t.Fatalf("alias lookup after the add: %v", err)
+		}
 	})
 
 	t.Run("renaming a combo into a taken name is refused and leaves the row alone", func(t *testing.T) {

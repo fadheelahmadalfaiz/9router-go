@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### 🐛 Custom model tertolak 409 kalau nama yang sama sudah dipakai model alias
+
+- 🔴 **Menambah model ke custom provider gagal dengan "a model alias "glm-5.1" already resolves this name, and an alias is consulted before a combo, so the combo would be unreachable".** Guard `guardNameCollision` menolak nama yang sudah ada di salah satu dari tiga ruang nama (combo / modelAlias / customModel), dan pasangan customModel-vs-modelAlias ikut diblokir. Padahal keduanya **tidak berbagi alamat**: custom model disimpan sebagai `<providerAlias>|<id>` dan dipanggil `<prefix>/<id>`, sementara alias hanya memiliki nama telanjang. Resolusi membuktikannya — request telanjang mengambil alias di step 2 (`resolveModel`), dan request ber-prefix tidak pernah menyentuh tabel alias telanjang sama sekali karena `resolvePrefixProvider` mencocokkan prefixnya. Satu menutupi yang lain tidak mungkin terjadi.
+- **Yang benar-benar shadow tetap ditolak:** alias vs combo. Combo hanya bisa dipanggil dengan nama telanjang, jadi alias dengan nama itu membuatnya benar-benar tidak terjangkau. Aturan itu tidak disentuh, dan tabrakan combo-vs-customModel juga tetap ditolak dengan alasan ambiguitas `/v1/models` seperti sebelumnya.
+- **Pesan errornya sekarang menyebut ruang nama yang sedang diisi** dan menyebut combo sebagai pihak yang terkena, bukan menyatakan "the combo would be unreachable" ke siapa pun yang sebenarnya sedang menambah custom model.
+- Ditutup test: `TestGuardNameCollision/a_model_alias_and_a_custom_model_id_may_share_a_name` dan `.../a_custom_model_id_may_reuse_a_name_an_alias_already_owns` — yang kedua meniru laporan ini persis: alias `glm-5.1` sudah ada, lalu `glm-5.1` ditambahkan sebagai custom model di node sendiri.
+
 ### ✨ Feature integration suite + `integration` CI job
 
 - **The gap this closes.** Every Go test until now called a handler directly or mounted a hand-built `chi` router. That shape cannot see a regression in the wiring production actually uses, and the failures it hides are exactly the ones nobody can reproduce by hand later: a route registered in the wrong auth group, the `middleware.RequestLogger` `/v1` rewrite dropped so every documented OpenAI URL 404s, account rotation no longer skipping a throttled connection, usage no longer being recorded. `internal/handlers/router_test.go` already documents two of these having shipped — the CLI-Tools 401 and the Codex reset-credit 404 — both found after the fact, both because a route was wired into a table the tests exercised but the server did not.
