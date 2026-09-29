@@ -37,6 +37,7 @@
     type ProviderModelItem,
     type SuggestedModel
   } from './types'
+  import { formatSweepOutcome, runSweep, type SweepOutcome } from './modelSweep'
   import { proxyBadgeInfo } from './proxyBadge'
   import AddConnectionModal from './AddConnectionModal.svelte'
   import AddCustomModelModal from './AddCustomModelModal.svelte'
@@ -2080,12 +2081,13 @@
     setTimeout(() => (copiedModelId = null), 2000)
   }
 
-  async function testModel(modelId: string) {
+  async function testModel(modelId: string, signal?: AbortSignal) {
     modelTestStatuses[modelId] = 'testing'
     modelTestErrors[modelId] = null
     activeModelTestError = null
     try {
-      const res = await api.testModel(`${storageAlias}/${modelId}`)
+      const res = await api.testModel(`${storageAlias}/${modelId}`, signal)
+      if (signal?.aborted) return
       if (res.ok) {
         modelTestStatuses[modelId] = 'ok'
         modelTestErrors[modelId] = null
@@ -2105,30 +2107,48 @@
 
   // Sequential on purpose: every model probe goes through the same account, and
   // firing 40 of them at once is both rude to the upstream and a good way to
-  // earn a rate limit on the very account being tested.
+  // earn a rate limit on the very account being tested. Both sweeps are
+  // cancellable — a bulk run on a long list is exactly the kind of action a
+  // misclick starts, and there has to be a way out of it.
   let isTestingAllModels = $state(false)
   let isTestingAllCompatibleModels = $state(false)
-  let allModelsTestSummary = $state<{ total: number; passed: number; failed: number } | null>(null)
-  let allCompatibleTestSummary = $state<{ total: number; passed: number; failed: number } | null>(
-    null,
-  )
+  let allModelsTestSummary = $state<SweepOutcome | null>(null)
+  let allCompatibleTestSummary = $state<SweepOutcome | null>(null)
+  let modelSweepController: AbortController | null = null
+  let compatibleSweepController: AbortController | null = null
+
+  function cancelModelSweep(): void {
+    modelSweepController?.abort()
+  }
+
+  function cancelCompatibleSweep(): void {
+    compatibleSweepController?.abort()
+  }
 
   async function handleTestAllModels() {
     if (isTestingAllModels) return
     const targets = visibleModels.map((model) => model.id)
     if (targets.length === 0) return
 
+    const controller = new AbortController()
+    modelSweepController = controller
     isTestingAllModels = true
     allModelsTestSummary = null
     activeModelTestError = null
 
-    let passed = 0
-    for (const modelId of targets) {
-      await testModel(modelId)
-      if (modelTestStatuses[modelId] === 'ok') passed++
+    try {
+      allModelsTestSummary = await runSweep(
+        targets,
+        async (modelId, signal) => {
+          await testModel(modelId, signal)
+          return modelTestStatuses[modelId] === 'ok'
+        },
+        controller.signal,
+      )
+    } finally {
+      isTestingAllModels = false
+      modelSweepController = null
     }
-    allModelsTestSummary = { total: targets.length, passed, failed: targets.length - passed }
-    isTestingAllModels = false
   }
 
   // Same sweep for a compatible node's own model list, which is the section a
@@ -2139,17 +2159,25 @@
     const targets = compatibleRows.map((row) => row.id)
     if (targets.length === 0) return
 
+    const controller = new AbortController()
+    compatibleSweepController = controller
     isTestingAllCompatibleModels = true
     allCompatibleTestSummary = null
     activeModelTestError = null
 
-    let passed = 0
-    for (const modelId of targets) {
-      await handleTestCompatibleModel(modelId)
-      if (compatibleTestResults[modelId] === 'ok') passed++
+    try {
+      allCompatibleTestSummary = await runSweep(
+        targets,
+        async (modelId, signal) => {
+          await handleTestCompatibleModel(modelId, signal)
+          return compatibleTestResults[modelId] === 'ok'
+        },
+        controller.signal,
+      )
+    } finally {
+      isTestingAllCompatibleModels = false
+      compatibleSweepController = null
     }
-    allCompatibleTestSummary = { total: targets.length, passed, failed: targets.length - passed }
-    isTestingAllCompatibleModels = false
   }
 
   async function handleDisableModel(modelId: string) {
@@ -2318,12 +2346,15 @@
     }
   }
 
-  async function handleTestCompatibleModel(modelId: string) {
+  async function handleTestCompatibleModel(modelId: string, signal?: AbortSignal) {
     if (compatibleTestId) return
     compatibleTestId = modelId
     compatibleTestErrors[modelId] = null
     try {
-      const res = await api.testModel(`${storageAlias}/${modelId}`)
+      const res = await api.testModel(`${storageAlias}/${modelId}`, signal)
+      // A probe we aborted says nothing about the model, so leave its state
+      // untouched rather than pinning a red "error" that never happened.
+      if (signal?.aborted) return
       if (res.ok) {
         compatibleTestResults[modelId] = 'ok'
         compatibleTestErrors[modelId] = null
@@ -2334,6 +2365,7 @@
         activeModelTestError = `${modelId}: ${err}`
       }
     } catch (err) {
+      if (signal?.aborted) return
       compatibleTestResults[modelId] = 'error'
       const msg = err instanceof Error ? err.message : 'Model test failed'
       compatibleTestErrors[modelId] = msg
@@ -3262,37 +3294,36 @@
         </button>
         <button
           type="button"
-          onclick={handleTestAllCompatibleModels}
-          disabled={isTestingAllCompatibleModels || compatibleRows.length === 0}
-          title="Probe every model of this provider, one at a time"
-          class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 active:scale-[0.97] bg-surface-2 hover:bg-surface-3 text-text-main border border-border h-8 px-4 text-xs rounded-[8px]"
+          onclick={isTestingAllCompatibleModels ? cancelCompatibleSweep : handleTestAllCompatibleModels}
+          disabled={!isTestingAllCompatibleModels && compatibleRows.length === 0}
+          title={isTestingAllCompatibleModels
+            ? 'Stop testing. Models already checked keep their result.'
+            : 'Probe every model of this provider, one at a time'}
+          class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 active:scale-[0.97] border h-8 px-4 text-xs rounded-[8px] {isTestingAllCompatibleModels
+            ? 'border-red-500/40 bg-red-500/10 text-red-500 hover:bg-red-500/15'
+            : 'bg-surface-2 hover:bg-surface-3 text-text-main border-border'}"
         >
           <span
             class="material-symbols-outlined text-[18px] {isTestingAllCompatibleModels
-              ? 'animate-spin'
+              ? ''
               : ''}"
           >
             {isTestingAllCompatibleModels ? 'progress_activity' : 'science'}
           </span>
-          {isTestingAllCompatibleModels
-            ? 'Testing…'
-            : allCompatibleTestSummary
-              ? 'Retest All Models'
-              : 'Test All Models'}
+          {isTestingAllCompatibleModels ? 'Cancel' : 'Test All Models'}
         </button>
       </div>
       {#if allCompatibleTestSummary}
         <div
-          class="mb-3 rounded-lg border p-3 text-xs {allCompatibleTestSummary.failed > 0
-            ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
-            : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'}"
+          class="mb-3 rounded-lg border p-3 text-xs {allCompatibleTestSummary.cancelled
+            ? 'border-border bg-surface-2 text-text-muted'
+            : allCompatibleTestSummary.failed > 0
+              ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+              : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'}"
           role="status"
           aria-live="polite"
         >
-          {allCompatibleTestSummary.passed}/{allCompatibleTestSummary.total} models reachable
-          {#if allCompatibleTestSummary.failed > 0}
-            · {allCompatibleTestSummary.failed} failed
-          {/if}
+          {formatSweepOutcome(allCompatibleTestSummary)}
         </div>
       {/if}
 
@@ -3390,19 +3421,19 @@
       <div class="flex gap-2">
         <button
           type="button"
-          onclick={handleTestAllModels}
-          disabled={isTestingAllModels || visibleModels.length === 0}
-          title="Probe every model of this provider, one at a time"
-          class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer disabled:cursor-not-allowed disabled:opacity-60 active:scale-[0.97] bg-surface-2 hover:bg-surface-3 text-text-main border border-border h-7 px-3 text-xs rounded-[8px]"
+          onclick={isTestingAllModels ? cancelModelSweep : handleTestAllModels}
+          disabled={!isTestingAllModels && visibleModels.length === 0}
+          title={isTestingAllModels
+            ? 'Stop testing. Models already checked keep their result.'
+            : 'Probe every model of this provider, one at a time'}
+          class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer disabled:cursor-not-allowed disabled:opacity-60 active:scale-[0.97] border h-7 px-3 text-xs rounded-[8px] {isTestingAllModels
+            ? 'border-red-500/40 bg-red-500/10 text-red-500 hover:bg-red-500/15'
+            : 'bg-surface-2 hover:bg-surface-3 text-text-main border-border'}"
         >
-          <span class="material-symbols-outlined text-[18px] {isTestingAllModels ? 'animate-spin' : ''}">
+          <span class="material-symbols-outlined text-[18px]">
             {isTestingAllModels ? 'progress_activity' : 'science'}
           </span>
-          {isTestingAllModels
-            ? 'Testing…'
-            : allModelsTestSummary
-              ? 'Retest All Models'
-              : 'Test All Models'}
+          {isTestingAllModels ? 'Cancel' : 'Test All Models'}
         </button>
         <button
           type="button"
@@ -3417,16 +3448,15 @@
 
     {#if allModelsTestSummary}
       <div
-        class="mb-3 rounded-lg border p-3 text-xs {allModelsTestSummary.failed > 0
-          ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
-          : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'}"
+        class="mb-3 rounded-lg border p-3 text-xs {allModelsTestSummary.cancelled
+          ? 'border-border bg-surface-2 text-text-muted'
+          : allModelsTestSummary.failed > 0
+            ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+            : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'}"
         role="status"
         aria-live="polite"
       >
-        {allModelsTestSummary.passed}/{allModelsTestSummary.total} models reachable
-        {#if allModelsTestSummary.failed > 0}
-          · {allModelsTestSummary.failed} failed
-        {/if}
+        {formatSweepOutcome(allModelsTestSummary)}
       </div>
     {/if}
 

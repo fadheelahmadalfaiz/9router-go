@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### ✨ "Test All Models" sekarang bisa dibatalkan di tengah jalan
+
+- 🔴 **Sekali diklik, sweep tidak bisa dihentikan.** Tombolnya langsung `disabled` selama seluruh daftar diproses, jadi salah klik pada provider dengan puluhan model berarti satu akun ikut di-probe sampai habis, dan tidak ada jalan keluar. Persis kekhawatiran yang dilaporkan: aksi massal yang salah klik harus bisa dibatalkan.
+- **Tombolnya berubah jadi "Cancel" (merah) selama sweep berjalan**, di kedua section (Available Models dan model custom provider). Menekannya menghentikan sweep pada model berikutnya, dan request yang sedang di-wire ikut dibatalkan — `api.testModel` sekarang menerima `AbortSignal` yang diteruskan ke `fetch`, jadi Cancel tidak perlu menunggu probe yang sedang jalan selesai.
+- **Model yang sudah sempat dicek tetap hasilnya, dan yang belum dicek tidak dicatat sebagai gagal.** Sweep ini membedakan "tested" from "total", jadi ringkasan setelah dibatalkan berbunyi "Stopped · 12 of 40 tested · 11 passed" alih-alih menuduh 28 model yang tidak pernah disentuh gagal. Probe yang di-cancel di tengah jalan juga tidak menyisakan badge merah palsu: `testModel` dan `handleTestCompatibleModel`kembali lebih dulu kalau sinyalnya sudah abort.
+- Logika sweep-nya dipindah ke `web/src/components/connections/modelSweep.ts` (murni, tanpa render) supaya perilaku cancel-nya bisa diuji: `bun test` 250 pass. Yang diuji termasuk cancel sebelum mulai, cancel di tengah, cancel yang membuat probe menolak (tidak boleh jadi failure), kegagalan asli yang tetap diteruskan, dan jaminan bahwa run yang dibatalkan tidak pernah dilaporkan sebagai "sepenuhnya reachable".
+
 ### 🐛 Custom model tertolak 409 kalau nama yang sama sudah dipakai model alias
 
 - 🔴 **Menambah model ke custom provider gagal dengan "a model alias "glm-5.1" already resolves this name, and an alias is consulted before a combo, so the combo would be unreachable".** Guard `guardNameCollision` menolak nama yang sudah ada di salah satu dari tiga ruang nama (combo / modelAlias / customModel), dan pasangan customModel-vs-modelAlias ikut diblokir. Padahal keduanya **tidak berbagi alamat**: custom model disimpan sebagai `<providerAlias>|<id>` dan dipanggil `<prefix>/<id>`, sementara alias hanya memiliki nama telanjang. Resolusi membuktikannya — request telanjang mengambil alias di step 2 (`resolveModel`), dan request ber-prefix tidak pernah menyentuh tabel alias telanjang sama sekali karena `resolvePrefixProvider` mencocokkan prefixnya. Satu menutupi yang lain tidak mungkin terjadi.

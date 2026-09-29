@@ -725,10 +725,11 @@ export const api = {
     request<{ success: boolean }>(`/api/models/alias?alias=${encodeURIComponent(alias)}`, {
       method: 'DELETE',
     }),
-  testModel: (model: string) =>
+  testModel: (model: string, signal?: AbortSignal) =>
     request<{ ok: boolean; error?: string }>('/api/models/test', {
       method: 'POST',
       body: JSON.stringify({ model }),
+      ...(signal ? { signal } : {}),
     }),
   testBatch: (payload: { mode: BatchTestMode; providerId?: string; providerIds?: string[] }) =>
     request<BatchTestResponse>('/api/providers/test-batch', {
