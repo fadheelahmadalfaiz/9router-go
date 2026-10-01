@@ -2,6 +2,130 @@
 
 ## [Unreleased]
 
+## [v1.9.6] - 2026-10-01
+
+### 🐛 Pre-release review: 5 blocker yang lolos semua gate (#70)
+
+Audit 42 commit `v1.9.5..main` sebelum rilis menemukan lima cacat yang **tidak**
+tertangkap `go vet`, `bun test`, maupun `-race`, karena test yang ada memock
+hal yang sama persis dengan jalur kodenya. Kelimanya sudah diperbaiki dan
+diuji dengan uji regresi yang gagal bila fix-nya dibalik (*mutation-checked*).
+
+- 🔴 **`9router-go status|stop|logs` buta terhadap `DATA_DIR` dari `.env`.**
+  `daemonURL()` dan `daemon.Dir()` membaca `os.Getenv`, sedangkan server
+  menyelesaikannya lewat viper yang membaca `.env`. Pada deployment yang
+  dikonfigurasi lewat `.env` saja — termasuk setiap docker compose — proses CLI
+  melihat direktori berbeda dari daemon yang sedang jalan: `status` melaporkan
+  *"not running"* padahal ada listener hidup, `stop` menolak untuk halt, dan
+  `logs` mengklaim tidak ada log padahal file-nya 50 KB. `ResolveDataDir()`
+  kini membaca `.env` (dengan urutan env → `.env` → default platform) dan
+  `daemonURL()` memakai `config.LoadConfig()` sehingga port yang diprobe sama
+  dengan yang di-bind.
+- 🔴 **Nama tool ter-fit bocor ke client di lane Claude `TranslateResp`.**
+  `handleClaudeMessagesStream` `return` di baris 19–46, **sebelum**
+  `decloaker := NewClaudeStreamDecloaker(req.ToolNameMap)` di baris 78. Request
+  sudah di-fit di `fallback.go:362`, jadi `content_block_start` tool_use sampai
+  ke client dengan nama 64 karakter dan tidak bisa di-dispatch. Non-stream
+  punya cacat serupa (passthrough di `claude_messages.go:191` keluar sebelum
+  decloak) — keduanya sekarang decloak sebelum branch mana pun. Decloaker
+  di-hoist ke atas `TranslateResp`.
+- 🔴 **Lane Responses: request tidak konsisten dengan dirinya sendiri.**
+  `FitToolNames` tidak punya walker `input[]` (hanya `tools`/`functions`/
+  `messages`/`contents`/`tool_choice`), padahal `RestoreToolNames` tetap
+  me-restore `output[]` (`fingerprint.go:282-311`). Akibatnya deklarasi tool
+  ter-fit ke 64 karakter sementara history masih memanggil nama aslinya 71
+  karakter — upstream menerima request yang bertentangan dengan dirinya, dan
+  fix 400-nya sendiri tidak benar-benar terpakai, karena nama panjang tetap
+  dibawa lewat `input`. Ditambahkan `visitInput`/`replaceInInput`
+  (`tool_fit.go`) yang berbagi satu walker untuk kedua arah, dan
+  `passthroughResponses` kini menerapkan `req.ToolNameMap` pada body non-stream
+  maupun lewat `sseStreamOpts` pada stream.
+- 🔴 **Idempotency key reset-credit kosong — proteksi double-redeem tidak
+  pernah ada.** `resetCreditIdempotencyKey` dideklarasikan tapi tidak pernah
+  di-assign di mana pun (`newIdempotencyKey()` adalah dead code), sehingga
+  tiap request mengirim `idempotencyKey: ""` dan server memint key baru per
+  request (`usage_codex_reset.go:176-178`) → dua submit innocuous =
+  dua kredit terbuang. Key kini di-mint saat modal dibuka, di-reset saat ditutup,
+  dan `confirmResetCredit` menolak mengirim key kosong. Helper-nya dipindah ke
+  `lib/codexResetCredit.ts` agar unit-testable sesuai konvensi repo.
+- 🔴 **`9router-go stop` di Windows tidak pernah graceful.** `stopGraceMS = 5000`
+  dideklarasikan, tapi `requestStop` di `proc_windows.go` selalu
+  `ErrStopUnsupported`, jadi `proc.Terminate` langsung `ForceKill` — drain
+  `server.Shutdown` 5 detik yang dirancang di `server.go:99-101` **tidak pernah
+  jalan** di Windows: setiap `stop`/`restart`/auto-update memotong SSE
+  in-flight dan SQL transaction setengah jalan. `Stop()` kini POST ke
+  `/api/version/shutdown` lebih dulu **dengan CLI token** (endpoint-nya
+  always-protected; tanpa token selalu 401 dan jatuh ke force-kill), dengan
+  `proc.Terminate` sebagai fallback untuk daemon yang tidak menjawab. Terverifikasi
+  live: log `Server stopped gracefully` pada 4 siklus restart beruntun.
+- 🔴 **Data race `usagetracker`** (ketemu saat rerun `-race`, pre-existing dan
+  tidak terkait 5 fix di atas): `scheduleBroadcastLocked` menyalin daftar
+  subscriber lalu melepas lock **sebelum** send, sedangkan `unsubscribe` menutup
+  channel di bawah write lock → *send on closed channel*. Map-nya terbaca aman,
+  channel-nya tidak. Kirim dipindah ke bawah `RLock`. Catatan: `8520e4e`
+  mengklaim "fix data race in usagetracker" tetapi hanya menambal ring seeding.
+- **Batas 64 karakter sekarang benar-benar diuji.** Fixture lama adalah 63 dan
+  65 karakter, jadi tidak ada yang mem-*pin* tepat di batas — dan batas itulah
+  yang jadi inti fitur ini. Ditambah `TestFitToolNames_ExactBoundary`.
+- **Verifikasi:** `go vet ./...` + `-tags=integration` 0 warning;
+  `go test -race -count=1 ./...` exit 0; `go test -tags=integration` ok;
+  `bun test` 115/115; `tsc -b`/`oxlint`/`bun run build` bersih;
+  `make build` + `make cross` (5 platform) sukses. Live: lifecycle daemon
+  start/status/restart/stop tanpa `DATA_DIR` ter-export, tool 71 karakter
+  kembali ke client sebagai 71 karakter, 7 route dashboard tanpa console
+  error.
+- **Ditunda (bukan blocker, tidak ikut PR ini):** self-update bisa memasang
+  binary tanpa verifikasi saat manifest tidak punya `sha256` (`updater.go:411`;
+  `release.yml` sudah menerbitkan `SHA256SUMS.txt` tapi tidak ada kode Go yang
+  membacanya); `parseSemver` membuang suffix prerelease sehingga RC bisa
+  terbaca lebih baru dari final dan di-auto-apply; `RunningPID` hanya percaya
+  PID telanjang sehingga PID daur-ulang bisa membuat `stop` membunuh proses
+  lain; `gateway.log` tidak pernah dirotasi dan dibaca utuh tiap 150 ms;
+  `signalSelfShutdown` kini dead code di kedua varian build; `tools[].toolSpec.name`
+  (Bedrock Converse) direkam tapi tidak ditulis.
+
+### 🐛 MCP tools dengan nama fungsi > 64 karakter mental dengan HTTP 400 (#68)
+
+- **Masalah:** Spesifikasi fungsi OpenAI / OpenAI-compatible membatasi panjang `function.name` maksimal 64 karakter (`^[a-zA-Z0-9_-]{1,64}$`). Coding agent dengan integrasi server MCP sering kali menggunakan nama namespaced (misal `mcp__server_name__action_detail_something`) yang melebihi 64 karakter, menyebabkan upstream provider (OpenAI, Console, Responses API, dll.) menolak request dengan status 400 Bad Request (`name must be at most 64 characters, got XX`).
+- **Perbaikan:**
+  - Ditambahkan `translator.FitToolNames` yang secara deterministik memangkas nama fungsi yang melebihi 64 karakter menjadi maksimal 64 karakter dengan sufiks unik `_1`, `_2`, dst (memperhitungkan panjang sufiks sehingga total panjang tidak pernah melebihi 64 karakter dan tidak bentrok dengan tools lain).
+  - Mengganti seluruh referensi nama fungsi di deklarasi `tools`, `functions`, conversation history (`messages` assistant `tool_calls`, `function_call`, `role: "tool"`/`role: "function"`, Claude `tool_use`), dan `tool_choice`.
+  - Mengintegrasikan pemulihan nama via `NewToolNameRestoringWriter` dan `RestoreToolNamesInPayload`, sehingga respons dari upstream (baik streaming SSE maupun non-streaming JSON, OpenAI/Claude/Responses/Gemini) dikembalikan ke nama asli yang panjang sebelum diteruskan ke client.
+  - Sesi multi-turn percakapan tetap sinkron karena pemotongan nama bersifat deterministik.
+- **Verifikasi:** Unit test `TestFitToolNames_*`, `TestRestoreToolNames_*` di `internal/translator/tool_fit_test.go` dan end-to-end integration test `TestE2E_FitToolNames_*` (non-streaming, SSE streaming, multi-turn) di `internal/handlers/chat/tool_fit_e2e_test.go` lolos dengan `go test -race` dan `go vet`.
+
+### 🐛 Fix dashboard feedback issues: login lockout, remote password rotation, proxy dropdown, combo model drag-and-drop, and zip database backup (#50)
+
+- **Login limiter IP bucketing**: `LoginClientIP` in `internal/auth/session.go` no longer falls back to `"unknown"` when no proxy headers are present. Direct TCP peer IP from `r.RemoteAddr` is used so distinct clients have their own failure buckets and one misconfigured client does not lock out all other users.
+- **Remote / Docker initial password rotation**: `POST /api/auth/login` now accepts `{ password, newPassword }`. Remote and Docker fresh installs requiring default password rotation can set their new password directly and receive a valid session cookie without encountering 401 Unauthorized from protected settings endpoints.
+- **Initial password change check**: `changeDashboardPassword` in `internal/handlers/dashboard/settings.go` now validates against `INITIAL_PASSWORD` when no password hash is stored.
+- **Provider proxy dropdown & Antigravity Free glitch**:
+  - In `ProviderDetailView.svelte`, the connection row Proxy button is now always rendered even if no proxy pools exist yet, displaying a clear empty state with a shortcut to create one.
+  - The proxy dropdown now uses `position: fixed` relative to the trigger button to prevent clipping inside the scroll container (`overflow-y-auto`).
+  - Wrapped `loadData()` inside `untrack` so that background polling of `connections` does not continuously re-trigger `loadData()`, eliminating the re-render flash / glitch on free providers like OpenCode Free and preventing proxy selection from resetting.
+- **Combo model drag-and-drop & picker performance**:
+  - Implemented HTML5 drag-and-drop reordering (`draggable`, `ondragstart`, `ondragover`, `ondrop`, `ondragend`) on model rows in `CreateComboModal.svelte` with active drag visual indicators.
+  - Preserved stable alphabetical ordering in `pickerData.ts` to eliminate layout shift, frame drops, and freezing when clicking model pills in `ModelPickerModal.svelte`.
+  - Added module-level caching for model picker metadata (`pickerExtras`) so opening the picker does not flash empty states or block UI interactions.
+- **Database backup download & ZIP archive support**:
+  - Deferred `URL.revokeObjectURL` in `ProfileSettingsView.svelte` to prevent modern Chromium/Firefox download managers from cancelling or blocking in-flight blob downloads.
+  - Added support for `?format=zip` in `GET /api/settings/database` to export backups as standard compressed `.zip` archives with `Content-Disposition: attachment`.
+  - Added support for importing `.zip` archives in `POST /api/settings/database`, automatically extracting and restoring the JSON payload.
+  - Updated `ProfileSettingsView.svelte` to download `.zip` by default and accept `.zip` as well as `.json` imports.
+
+### ✅ Binary bisa jalan di background — `9router-go start` / `stop` / `restart` / `status` / `logs`
+
+- **Opsi baru:** `--background` (alias `-d`) dan sub-command `start` menjalankan gateway sebagai proses terpisah yang tidak menempel ke terminal, lalu langsung kembali. Sub-command baru: `stop`, `restart`, `status`, `logs -n <baris>`. Perilaku lama (`9router-go` tanpa flag) **tidak berubah** — tetap jalan di foreground dan berhenti saat `^C`.
+- **PID file & log:** proses yang terpisah mencatat dirinya di `DATA_DIR/run/gateway.pid` dan menulis stdout/stderr ke `DATA_DIR/run/gateway.log`. File PID basi dibersihkan saat command berikutnya jalan, sehingga daemon yang dibunuh paksa dari Task Manager tidak meninggalkan jejak yang menyesatkan.
+- **`Start` menolak saat port sudah dipakai** — pre-flight TCP connect, bukan sekadar mengandalkan PID file. Diuji dengan server Python yang memegang port: `start` gagal dengan pesan yang menyebut port dan sumbernya, bukan melombakan dua proses untuk satu bind.
+- **Dua bug Windows nyata yang ketemu dan diperbaiki di jalur yang sama.** (1) `HandleShutdown` (tombol Shutdown di dashboard) self-signal `SIGTERM`, dan `os.Process.Signal(syscall.SIGTERM)` di Windows mengembalikan `not supported by windows` — tombolnya tidak pernah menghentikan server. (2) `RestartSelf()` melakukan `os.Exit(0)` sebelum listener ditutup, lalu spawn spawn replacement, sehingga proses baru bisa rebut port sebelum yang lama melepaskannya. Keduanya kini lewat `shutdown.RequestStop()` / `shutdown.RunAfterStop()`: main menunggu tiga sumber (`SIGINT`, `SIGTERM`, stop request), menjalankan `fxApp.Stop`, baru menjalankan hook spawn. Terbukti: `POST /api/version/shutdown` dengan session cookie → proses mati, port `20197` benar-benar lepas.
+- **Detail restart yang sempat bikin bug:** `Restart` harus **stop dulu baru pre-flight**. Kalau pre-flight dijalankan lebih dulu, ia menemukan daemon lama yang masih listen dan reported "already running"; kalau dijalankan sesudah `TerminateProcess`, socket-nya baru diedit sangat sedikit. Urutan stop → tunggu port bebas (maks 10 dtk) → start sudah teruji: pid `21700` → restart → pid `17628`, `/health` tetap `{"status":"ok"}`.
+- **Baru `internal/proc`:** primitif proses portabel ( Alive / Terminate / Detached / SelfExecutable ) dipakai bersama oleh daemon **dan** headroom; `internal/headroom/sig_unix.go` + `sig_windows.go` yang menduplikasi logika yang sama dihapus.
+- **Yang berubah di API shutdown:** `shutdown.RequestStop()` menutup channel baru `StopRequested()` sekaligus memicu `Cancel()` (SSE berhenti). `Cancel()` saja **tidak** menutup `StopRequested()` — `^C` bukan permintaan keluar dari operator, dan main harus terus menunggu sinyal asli. Dipin di `internal/shutdown/shutdown_test.go`.
+- **Verifikasi:** `go vet ./...` bersih, `go build ./...` bersih, `go test ./internal/...` semua paket hijau kecuali `TestApplyConnectionStrategy_KeepsRotatingPastFirstCycle` yang **sudah gagal sebelum perubahan ini** (dibuktikan di worktree bersih pada `HEAD` `9323d21`, bukan efek samping). Smoke penuh di Windows: start → `/health` `{"status":"ok"}` → `/login` 200 → status → restart (pid baru) → health → stop → pid file hilang → port tidak lagi `LISTENING`; `-d` identik dengan `start`; start kedua refused "already running"; foreground tidak menulis pid file sama sekali.
+
+> ⚠️ **Perbedaan perilaku antar-platform yang disengaja:** di Windows tidak ada SIGTERM, jadi `stop` memakai `TerminateProcess` (proses langsung mati, drain SSE dilewati). Di POSIX, stop mengirim SIGTERM sehingga hook Fx berjalan dan `runServer` keluar bersih. Yang butuh drain (update via dashboard, restart) sebaiknya lewat `restart` atau tombol Shutdown, bukan `stop` di Windows.
+
 ### 🐛 Makefile hanya jalan di POSIX shell — di Windows setiap target build/run rusak
 
 - 🔴 **Semua gejala berasal dari sintaks POSIX di dalam recipe.** `VERSION ?= $(shell cat VERSION 2>/dev/null …)` mengembalikan string kosong di shell non-POSIX (`/dev/null` tidak ada), jadi `-X …CurrentVersion=` meng-embed versi **kosong** ke binary. `PORT=20130 ./9router-go` membuat cmd.exe mencoba menjalankan program bernama `PORT`. `run`/`version`/`update`/`mitm-*` memanggil `./$(BINARY_NAME)`, dan cmd.exe menjawab `'.' is not recognized as an internal or external command` karena `.` tidak ada di PATH (PATHEXT hanya menyertakan `.EXE`). `LDFLAGS` diapit tanda kutip tunggal, dan cmd.exe memperlakukan `'` sebagai karakter literal sehingga linker menerima nama simbol yang sudah ter-quote. `DATA_DIR ?= $(HOME)/.9router` expandable jadi kosong di native Windows → path literal `/.9router` → `C:/Program Files/Git/.9router`, sehingga **setiap** `make run` menulis DB sementara yang baru dan dashboard membalas 401 terus-menerus.
