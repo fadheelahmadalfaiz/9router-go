@@ -21,7 +21,17 @@ describe('parseUsageUrlState', () => {
     { name: 'keeps the logs tab', search: '?tab=logs', expected: { ...base, tab: 'logs' } },
     { name: 'keeps the all period', search: '?period=all', expected: { ...base, period: 'all' } },
     { name: 'rejects an unknown tab', search: '?tab=nope', expected: base },
-    { name: 'rejects an unknown period', search: '?period=90d', expected: base },
+    { name: 'rejects a non-period period', search: '?period=banana', expected: base },
+    {
+      name: 'keeps a custom day window',
+      search: '?period=90d',
+      expected: { ...base, period: '90d' },
+    },
+    {
+      name: 'keeps a custom hour window',
+      search: '?period=12h',
+      expected: { ...base, period: '12h' },
+    },
     { name: 'rejects an unknown table view', search: '?table=combo', expected: base },
     { name: 'rejects an unknown view mode', search: '?view=raw', expected: base },
     { name: 'rejects an unsortable field', search: '?sortBy=__proto__', expected: base },

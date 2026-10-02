@@ -1,7 +1,7 @@
 // Query-string state for /dashboard/usage so the tab, period, table view and
 // sort order survive a refresh, can be shared as a link, and are restored by
 // back/forward. Pure helpers only: the component owns the history side effects.
-import { PERIODS, TABLE_OPTIONS, type MainTab, type Period, type SortOrder, type TableView, type ViewMode } from './types'
+import { PERIODS, TABLE_OPTIONS, normalizeCustomPeriod, type MainTab, type Period, type SortOrder, type TableView, type ViewMode } from './types'
 
 export interface UsageUrlState {
   tab: MainTab
@@ -64,6 +64,16 @@ function pickEnum<T extends string>(raw: string | null, options: { value: T }[],
   return options.some((o) => o.value === value) ? (value as T) : fallback
 }
 
+// A period is either a preset from the dropdown or a custom "<n>d"/"<n>h"
+// window the picker produced. Validating against PERIODS alone would silently
+// reset a custom period to the default on every refresh, so custom windows are
+// normalized and kept too; anything else falls back like any other bad param.
+function parsePeriod(raw: string | null): Period {
+  const value = (raw || '').trim()
+  if (PERIODS.some((o) => o.value === value)) return value as Period
+  return normalizeCustomPeriod(value) ?? USAGE_URL_DEFAULTS.period
+}
+
 function parseSortBy(raw: string | null): string {
   const value = (raw || '').trim()
   return SORTABLE_FIELDS.has(value) ? value : USAGE_URL_DEFAULTS.sortBy
@@ -79,7 +89,7 @@ export function parseUsageUrlState(search: string): UsageUrlState {
   const params = new URLSearchParams(search || '')
   return {
     tab: pick(params.get(USAGE_URL_PARAMS.tab), TABS, USAGE_URL_DEFAULTS.tab),
-    period: pickEnum(params.get(USAGE_URL_PARAMS.period), PERIODS, USAGE_URL_DEFAULTS.period),
+    period: parsePeriod(params.get(USAGE_URL_PARAMS.period)),
     table: pickEnum(params.get(USAGE_URL_PARAMS.table), TABLE_OPTIONS, USAGE_URL_DEFAULTS.table),
     view: pick(params.get(USAGE_URL_PARAMS.view), VIEWS, USAGE_URL_DEFAULTS.view),
     sortBy: parseSortBy(params.get(USAGE_URL_PARAMS.sortBy)),

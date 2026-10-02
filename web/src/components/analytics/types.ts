@@ -1,4 +1,6 @@
-export type MainTab = 'overview' | 'details'
+// 'logs' is a rendered tab in this dashboard, not only a deep link like
+// upstream, so this union keeps it; dropping it breaks the tab list and URL state.
+export type MainTab = 'overview' | 'details' | 'logs'
 export type PeriodPreset = 'today' | '24h' | '7d' | '30d' | '60d' | 'all'
 // A custom entry is "<n>d" or "<n>h"; the server parses both, so the selector is
 // not limited to the presets below.

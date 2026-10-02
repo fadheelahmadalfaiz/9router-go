@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### 🚑 Perbaikan build Docker + 10 handler kuota yang hilang dampak merge upstream
+
+Dua kelas kerusakan dari merge `chore(sync): merge upstream luqman-v1/9router-go@main`. Build Docker gagal di stage web-builder, dan setelah itu diperbaiki ternyata stage Go juga tidak kompilasi - jadi kegagalan pertama hanya menutupi yang kedua.
+
+**1. Frontend tidak ter-compile (`bun run build` exit 2).** Merge menimpa `analytics/types.ts` dengan versi upstream yang ber-`MainTab = 'overview' | 'details'`, sementara dashboard ini merender tab **Logs** sebagai tombol nyata (upstream hanya menjangkaunya lewat `?tab=logs`). Akibatnya `urlState.ts` menolak `'logs'` dan `tsc` menghentikan build:
+
+```
+src/components/analytics/urlState.ts(33,49): error TS2322: Type '"logs"' is not assignable to type 'MainTab'.
+```
+
+- `MainTab` dikembalikan ke `'overview' | 'details' | 'logs'`, dengan komentar kenapa union-nya tidak boleh disamakan dengan upstream.
+- Sekalian menutup bug senyap yang dibawa merge: upstream menambah **period custom** (`<n>d` / `<n>h`, server mem-parsing keduanya), tapi `parseUsageUrlState` hanya memvalidasi terhadap preset `PERIODS`. Akibatnya `?period=12h` ditolak saat refresh dan period custom **hilang**, persis gejala "filter tidak bertahan setelah refresh" yang dilaporkan sebelumnya. Sekarang `parsePeriod` menerima preset *atau* period custom yang ternormalisasi.
+
+**2. Sepuluh case provider hilang dari dispatcher kuota.** Commit sync `237f9ca` menghapus case-case ini dari `fetchProviderUsage`, tetapi file handler dan seluruh test-nya tetap ada - jadi ini regresi, bukan penghapusan yang disengaja:
+
+```
+minimax, minimax-cn, claude, github, gemini-cli, glm, glm-cn, kimi, zed, freebuff, vercel-ai-gateway, iflow
+```
+
+- Semuanya jatuh ke `default: return usageResult{}, false`, sehingga kuota provider-provider tersebut **mati total** - dashboard menampilkan "0 / ∞" / kartu kosong, atau `Usage API not implemented for <provider>`. Ini persis yang diperingatkan komentar test-nya sendiri: *"A missing case is invisible until the dashboard shows 0 / ∞ or an empty card."*
+- Case-case itu dipulihkan, sambil **mempertahankan** perbaikan upstream yang sah di fungsi yang sama (`kiroUsageToken` dan case baru `opencode-zen`).
+- `force` kini diteruskan ke `fetchProviderUsage` di kedua call site `usage.go`; argumen ini diabaikan handler yang membaca state live, dan hanya berarti bagi handler yang meng-cache per token (claude).
+
+Verifikasi: `go build ./...` exit 0, `go test ./internal/handlers/dashboard/...` **ok** (test Claude, MiniMax, GitHub, GLM, Kimi, Zed, Freebuff, Vercel, iFlow hijau kembali), `go vet` bersih, `bun test` 276 pass, `bun run build` exit 0, `bun run lint` bersih. Satu kegagalan tersisa di `internal/handlers/chat` (`TestApplyConnectionStrategy_KeepsRotatingPastFirstCycle`) bersifat flaky dan sudah ada sebelum merge - pesan gagalnya berubah antar-run dan file test-nya tidak tersentuh merge.
+
 ### 🐛 Manifest tanpa checksum membuat auto-update mati total — issue #72
 
 #72 membuat digest SHA256 **wajib**: `PerformSelfUpdate` menolak sebelum request

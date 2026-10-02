@@ -96,7 +96,7 @@ func (h *DashboardHandler) HandleGetConnectionUsage(w http.ResponseWriter, r *ht
 		}
 	}
 
-	res, ok := fetchProviderUsage(r.Context(), conn.Provider, data)
+	res, ok := fetchProviderUsage(r.Context(), conn.Provider, data, force)
 	// Upstream force-refreshes and retries exactly once here
 	// (src/app/api/usage/[connectionId]/route.js): a stored access token can age
 	// out while the refresh token is still good. That retry is only worth a call
@@ -108,7 +108,7 @@ func (h *DashboardHandler) HandleGetConnectionUsage(w http.ResponseWriter, r *ht
 		if retry.err != nil {
 			log.Warn("usage", "forced credential refresh failed", "provider", conn.Provider, "conn", connID, "error", retry.err)
 		} else if retry.refreshed {
-			if retried, retryOK := fetchProviderUsage(r.Context(), conn.Provider, data); retryOK {
+			if retried, retryOK := fetchProviderUsage(r.Context(), conn.Provider, data, force); retryOK {
 				handlerutil.WriteJSON(w, http.StatusOK, retried.toResponse())
 				return
 			}
