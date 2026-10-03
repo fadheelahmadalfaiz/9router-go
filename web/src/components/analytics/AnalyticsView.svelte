@@ -328,8 +328,67 @@
     window.history.replaceState({ tab: 'analytics', usage: nextState }, '', url)
   }
 
-  $effect(() => {
-    syncUrl({ tab: activeTab, period, table: tableView, view: viewMode, sortBy, sortOrder })
+  let topologyProviders = $derived.by(() => {
+    const seen = new Set<string>()
+    const list: { id: string; alias?: string; name: string; color?: string; type: string }[] = []
+
+    const addProvider = (provId: string, type: string, customName?: string) => {
+      if (!provId) return
+      const canonical = provId.toLowerCase().trim()
+      const cat = PROVIDER_CATALOG.find((p) => p.id.toLowerCase() === canonical || (p.alias && p.alias.toLowerCase() === canonical))
+      // A provider the registry hides stays routable, but it has no place in a
+      // map that reads as "who is on the bus" — the same reason it is kept out
+      // of the provider list.
+      if (cat?.hidden) return
+      const targetId = cat?.id || canonical
+      if (seen.has(targetId)) return
+      seen.add(targetId)
+      if (cat?.alias) seen.add(cat.alias.toLowerCase())
+      seen.add(canonical)
+
+      list.push({
+        id: targetId,
+        alias: cat?.alias,
+        name: topologyName(targetId, customName),
+        color: cat?.color || '#3B82F6',
+        type
+      })
+    }
+
+    // 1. Prioritize active & live providers so lines to models in use never get dropped
+    for (const r of activeRequests) {
+      if (r.provider) addProvider(r.provider, 'active')
+    }
+    if (pulseProvider) addProvider(pulseProvider, 'active')
+    if (lastProvider) addProvider(lastProvider, 'recent')
+    if (errorProvider) addProvider(errorProvider, 'error')
+
+    // 2. Add recent requests
+    for (const r of stats.recentRequests || []) {
+      if (r.provider) addProvider(r.provider, 'recent')
+    }
+
+    // 3. Add active user-configured connections
+    for (const c of connections) {
+      if (c.isActive !== 0 && c.provider) {
+        addProvider(c.provider, 'connection', c.name || undefined)
+      }
+    }
+
+    // 4. Add historical providers with usage
+    if (stats.byProvider) {
+      for (const prov of Object.keys(stats.byProvider)) {
+        addProvider(prov, 'stats')
+      }
+    }
+
+    // 5. Ensure core free/no-auth defaults are present
+    const FREE_DEFAULTS = ['antigravity', 'opencode', 'nvidia', 'openrouter', 'clinepass']
+    for (const f of FREE_DEFAULTS) {
+      addProvider(f, 'default')
+    }
+
+    return list
   })
 
   function restoreUrlState(): void {
@@ -420,7 +479,6 @@
                 <input
                   id="custom-period"
                   type="text"
-                  inputmode="numeric"
                   placeholder="14d"
                   bind:value={customPeriodInput}
                   onkeydown={(e) => e.key === 'Enter' && applyCustomPeriod()}
