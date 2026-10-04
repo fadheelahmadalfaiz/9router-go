@@ -63,6 +63,8 @@ export interface Settings {
   cavemanLevel?: string
   ponytailEnabled?: boolean
   ponytailLevel?: string
+  adhdEnabled?: boolean
+  adhdLevel?: string
   headroomEnabled?: boolean
   headroomUrl?: string
   headroomTimeoutMs?: number
@@ -1153,17 +1155,17 @@ export const api = {
       { method: 'POST' }
     ),
   deployVercelRelay: (payload: { vercelToken: string; projectName?: string }) =>
-    request<{ success?: boolean; proxyUrl?: string; deployUrl?: string; error?: string }>('/proxy-pools/vercel-deploy', {
+    request<{ success?: boolean; proxyUrl?: string; deployUrl?: string; error?: string }>('/api/proxy-pools/vercel-deploy', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
   deployCloudflareRelay: (payload: { accountId: string; apiToken: string; projectName?: string }) =>
-    request<{ success?: boolean; proxyUrl?: string; deployUrl?: string; error?: string }>('/proxy-pools/cloudflare-deploy', {
+    request<{ success?: boolean; proxyUrl?: string; deployUrl?: string; error?: string }>('/api/proxy-pools/cloudflare-deploy', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
   deployDenoRelay: (payload: { denoToken: string; orgDomain: string; projectName?: string }) =>
-    request<{ success?: boolean; proxyUrl?: string; deployUrl?: string; error?: string }>('/proxy-pools/deno-deploy', {
+    request<{ success?: boolean; proxyUrl?: string; deployUrl?: string; error?: string }>('/api/proxy-pools/deno-deploy', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
