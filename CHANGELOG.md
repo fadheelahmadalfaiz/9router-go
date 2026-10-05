@@ -1,6 +1,93 @@
 # Changelog
 
 ## [Unreleased]
+
+## [v1.9.9] - 2026-10-05
+
+### 🐛 `TestGateAcquire_JitterOnlyWidensTheGap` masih flaky — stopwatch diukur dari slot sebelumnya
+
+PR #146 menaikkan floor 30ms → 40ms dan changelog-nya menyatakan test itu
+dipertahankan karena "tidak ada bukti ia perlu disentuh". Di branch ini
+buktinya ada, dan kali ini bukan margin yang kurang: `go test -race -shuffle=on
+./...` gagal
+
+```
+fetchgate (4 passed, 1 failed)
+  [FAIL] TestGateAcquire_JitterOnlyWidensTheGap
+     gate_test.go:115: slot 5 waited 39.4323ms, want at least the 40ms floor
+```
+
+`go test ./internal/fetchgate/ -race -count=8` sendirian hijau, jadi ini
+beban-suite, bukan gate. Akar masalahnya batas stopwatch: loop mengukur
+`time.Since(start)` dengan `start := time.Now()` yang diambil **setelah**
+`Acquire` sebelumnya kembali. Floor gate adalah properti *reservasi* —
+`reserve` menerbitkan `start`, lalu tidur sampai `start` — sehingga slot yang
+dijanjikan selalu berjarak `minGap`, kecuali latensi bangun goroutine
+sebelumnya ikut dipotong dari gap berikutnya.
+Angka `start` diukur setelah itu, jadi latensi yang tidak ada hubungannya
+dengan gate ikut terpotong dari gap yang sedang diuji. Itu juga alasan indeks
+gagalnya selalu di tengah-tengah dan berpindah-pindah: hanya soal seberapa
+lambat goroutine sebelumnya kebetulan dibangunkan.
+
+Menaikkan floor lagi hanya memperpanjang test, tidak memperbaiki ukurannya.
+Pengukuran dipindah ke sumber yang benar — start yang dijanjikan gate:
+
+1. `TestGateAcquire_JitterOnlyWidensTheGap` membandingkan `start` yang
+   dikeluarkan `reserve`, jadi bebas-noise total, sambil tetap memverifikasi
+   assertion aslinya: tidak ada gap di bawah floor, dan minimal satu gap
+   lebih lebar dari floor sehingga jitter benar-benar ikut bermain. Draw
+   semua nol delapan kali berpeluang `(1/61)^8`, jadi run tanpa jitter sama
+   sekali bukan hasil nyata.
+2. `TestGateAcquire_FloorHoldsWithoutJitter` baru, deterministik: dengan
+   jitter dimatikan tiap gap harus **tepat** `minGap`. Inilah yang menangkap
+   floor yang dihapus — test ber-jitter tidak bisa, karena draw di bawah
+   `minGap` itu sah.
+3. `TestGateAcquire_WaitsOutTheReservedSlot` baru: `Acquire` benar-benar
+   menunggu slot yang ia reservasi. Stopwatch-nya dimulai **sebelum**
+   reservasi, jadi satu-satunya yang bisa hilang adalah timer yang terlalu
+   cepat — dan timer Go terlambat, tidak pernah cepat — sehingga arah
+   pengukuran ini aman untuk diasersikan persis.
+
+`internal/fetchgate/gate.go` tidak tersentuh: nol perubahan produksi.
+
+**Verifikasi:** `go vet ./internal/fetchgate/` bersih ·
+`go test ./internal/fetchgate/ -race -count=3` hijau ·
+`go test ./internal/fetchgate/ -race -count=5 -p 16` hijau. Kekuatan test
+dibuktikan dengan sengaja menghapus floor
+(`g.next = start.Add(g.jitter())`), yang membuat keempat test gagal —
+termasuk `JitterOnlyWidensTheGap` di `slot 3` dengan
+`32.86ms < 40ms`, dan itu pun deterministik: pengukurannya tidak lagi
+bergantung pada penjadwalan.
+
+### 🏷️ Nama provider asli tampil di tab Details pada dashboard Usage
+
+Latar: kolom `Provider` di tab **Details** (`/dashboard/usage`) menampilkan
+`item.provider` mentah. Untuk provider kustom, nilai itu id sintetis
+(`openai-compatible-chat-<uuid>`), jadi tabel terbaca
+`openai-compatible-chat-46b3f72a-5618-4485-8527-0eb4424e85db` alih-alih nama
+yang dikonfigurasi user (`tiarina`).
+
+Parity: upstream memakai `getProviderName(detail.provider, cache)` di
+`RequestDetailsTab.js`, dengan cache gabungan `AI_PROVIDERS` +
+`providerNodes` (`node.id → node.name`). Sumber nama itu persis yang sudah
+dipakai kartu topologi di port ini (`AnalyticsView.topologyName`).
+
+Perbaikan (`web/src/components/analytics/`):
+1. `providerDisplayName()` baru di `types.ts` — node kustom menang lebih dulu,
+   lalu nama katalog, lalu id apa adanya.
+2. `RequestDetailsTab` menerima `providerNodes` dan memakai nama itu di badge
+   tabel **dan** di header modal inspector. Id mentah tetap tersedia sebagai
+   `title` (tooltip) dan di panel Payload, jadi tidak ada informasi yang hilang.
+3. Kolom breakdown di tab Overview **tidak** disentuh — `provider` di sana
+   sudah di-resolve server (`nodeNameMap` di
+   `internal/handlers/usage_stats.go:191`).
+
+**Verifikasi:** `bun test` (210 pass, termasuk 4 kasus baru untuk
+`providerDisplayName`), `bun run ratchet:svelte` (0 unresolved identifier,
+92 error = baseline), dan smoke ke instance dengan 9.862 baris `requestDetails`:
+baris yang sebelumnya terbaca `openai-compatible-chat-46b3f72a-…` kini
+`tiarina` / `OpenCode Zen`, icon `/providers/oai-cc.png` tetap terpakai.
+
 ### 🩺 Penolakan proxy egress kini terlihat di Usage & Analytics
 
 Latar: `tryForwardWithConnection` gagal **terlalu awal** saat pool proxy yang

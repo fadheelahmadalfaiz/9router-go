@@ -1,6 +1,6 @@
-// 'logs' is a rendered tab in this dashboard, not only a deep link like
-// upstream, so this union keeps it; dropping it breaks the tab list and URL state.
-export type MainTab = 'overview' | 'details' | 'logs'
+import { PROVIDER_CATALOG } from '../../lib/providers'
+
+export type MainTab = 'overview' | 'details'
 export type PeriodPreset = 'today' | '24h' | '7d' | '30d' | '60d' | 'all'
 // A custom entry is "<n>d" or "<n>h"; the server parses both, so the selector is
 // not limited to the presets below.
@@ -127,6 +127,23 @@ export const TABLE_OPTIONS: { value: TableView; label: string }[] = [
   { value: 'apiKey', label: 'Usage by API Key' },
   { value: 'endpoint', label: 'Usage by Endpoint' },
 ]
+
+// providerDisplayName resolves a stored provider id to the label the dashboard
+// shows. Custom compatible nodes persist under a synthetic id
+// ("openai-compatible-chat-<uuid>") and the catalog carries the display name for
+// everything else, so the column never renders an opaque id. Unknown ids pass
+// through unchanged.
+export function providerDisplayName(
+  providerId?: string | null,
+  nodes?: { id: string; name?: string }[]
+): string {
+  const id = (providerId || '').trim()
+  if (!id) return 'unknown'
+  const node = nodes?.find((n) => n?.id === id)
+  if (node?.name) return node.name
+  const cat = PROVIDER_CATALOG.find((p) => p.id === id || p.alias === id)
+  return cat?.name || id
+}
 
 export function fmt(n?: number): string {
   return (n || 0).toLocaleString()

@@ -559,6 +559,7 @@
       {detailsLoading}
       onPageChange={loadDetails}
       onRefresh={() => loadDetails(detailsPage)}
+      {providerNodes}
     />
   {:else}
     <RequestLogsView />
