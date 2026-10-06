@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { onMount } from 'svelte'
-  import { api, getAuthHeaders, type ProviderConnection, type ProviderNode } from '../../api/client'
-  import { pathToTab } from '../../lib/router'
+  import { api, getAuthHeaders, normalizeLastError, type ProviderConnection, type ProviderNode } from '../../api/client'
+  import { PROVIDER_CATALOG } from '../../lib/providers'
+  import Card from '../../lib/ui/Card.svelte'
   import {
     fmt,
     timeAgo,
@@ -105,6 +105,13 @@
   let pulseProvider = $state<string>('')
   let lastProvider = $state<string>('')
   let errorProvider = $state<string>('')
+
+  // A failed stats read leaves the previous period's numbers on screen, and
+  // those read as live. Since #148 the server answers 500 instead of a zeroed
+  // body, so the failure arrives here as a thrown error: keep the message, and
+  // let the template show the stale data as stale rather than as current.
+  let statsError = $state('')
+  let detailsError = $state('')
   let pulseTimer: ReturnType<typeof setTimeout> | null = null
 
   function triggerPulse(provider: string) {
@@ -143,6 +150,7 @@
     try {
       const res = await api.getUsageStats(targetPeriod)
       if (res) {
+        statsError = ''
         stats = res
         if (Array.isArray(res.activeRequests)) {
           activeRequests = res.activeRequests
@@ -159,6 +167,11 @@
         }
       }
     } catch (err) {
+      // A broken read used to arrive as a zeroed 200 and land on screen as
+      // "no traffic this period". The server now answers 500, so the failure
+      // has to be named here or it vanishes into the console while the
+      // previous period's numbers keep being read as current.
+      statsError = normalizeLastError(err) || 'Usage could not be loaded.'
       console.error('Failed to load usage stats:', err)
     } finally {
       isFetching = false
@@ -167,6 +180,7 @@
 
   async function loadDetails(page = 1) {
     detailsLoading = true
+    detailsError = ''
     try {
       const limit = 20
       const offset = (page - 1) * limit
@@ -177,6 +191,7 @@
         detailsPage = page
       }
     } catch (err) {
+      detailsError = normalizeLastError(err) || 'Request details could not be loaded.'
       console.error('Failed to load request details:', err)
     } finally {
       detailsLoading = false
@@ -382,10 +397,17 @@
       }
     }
 
-    // 5. Ensure core free/no-auth defaults are present
+    // 5. Free/no-auth defaults, but only once they have actually been used.
+    //    Upstream #4615: no-auth providers store no connection, so the old
+    //    unconditional pass drew every catalog free provider on a map that
+    //    reads as "who is on the bus" — including ones never routed a request.
+    //    Providers with real usage already entered above via stats.byProvider,
+    //    so this only has to cover the ids whose usage key the map lacks.
+    const usedInPeriod = (provId: string) =>
+      (stats.byProvider?.[provId]?.requests || 0) > 0
     const FREE_DEFAULTS = ['antigravity', 'opencode', 'nvidia', 'openrouter', 'clinepass']
     for (const f of FREE_DEFAULTS) {
-      addProvider(f, 'default')
+      if (usedInPeriod(f)) addProvider(f, 'default')
     }
 
     return list
@@ -512,6 +534,32 @@
     {/if}
   </div>
 
+  <!-- A failed read leaves the previous period's numbers below, so say what
+       happened and mark them stale rather than let them read as current. The
+       retry is the same load the refresh button already calls. -->
+  {#if activeTab === 'overview' && statsError}
+    <div
+      role="alert"
+      class="flex flex-col gap-2 rounded-[14px] border border-red-500/30 bg-surface px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
+    >
+      <div class="flex min-w-0 items-start gap-2">
+        <span class="material-symbols-outlined mt-px text-[18px] text-red-600 dark:text-red-400" aria-hidden="true">error</span>
+        <div class="min-w-0">
+          <p class="text-sm font-medium text-text-main">Usage could not be loaded. The figures below are from the last successful read.</p>
+          <p class="mt-0.5 break-words text-[11px] text-text-muted">{statsError}</p>
+        </div>
+      </div>
+      <button
+        type="button"
+        onclick={() => loadStats(period)}
+        disabled={isFetching}
+        class="shrink-0 self-start rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-text-main transition-colors hover:bg-surface-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/50 disabled:opacity-50 sm:self-auto"
+      >
+        {isFetching ? 'Retrying…' : 'Retry'}
+      </button>
+    </div>
+  {/if}
+
   {#if activeTab === 'overview'}
     <!-- 5 Overview KPI Cards -->
     <SummaryKpiCards {stats} />
@@ -526,7 +574,56 @@
         {errorProvider}
         onRefresh={() => loadStats(period)}
       />
-      <RecentRequestsCard requests={stats.recentRequests || []} />
+      <!-- Recent Requests Card -->
+      <div class="bg-surface border border-border-subtle rounded-[14px] shadow-[var(--shadow-soft)] p-4 flex min-w-0 flex-col overflow-hidden" style="height: 480px">
+        <div class="px-1 py-2 border-b border-border shrink-0">
+          <span class="text-xs font-semibold text-text-muted uppercase tracking-wide">Recent Requests</span>
+        </div>
+
+        {#if !stats.recentRequests || stats.recentRequests.length === 0}
+          <div class="flex-1 flex items-center justify-center text-text-muted text-xs">
+            No requests recorded yet.
+          </div>
+        {:else}
+          <div class="flex-1 overflow-y-auto">
+            <table class="w-full table-fixed min-w-[280px] border-collapse text-xs">
+              <colgroup>
+                <col class="w-[20px]" />
+                <col />
+                <col class="w-[96px]" />
+                <col class="w-[56px]" />
+              </colgroup>
+              <thead class="sticky top-0 bg-bg z-10">
+                <tr class="border-b border-border">
+                  <th class="py-1.5 pl-3 text-left font-semibold text-text-muted"></th>
+                  <th class="py-1.5 text-left font-semibold text-text-muted">Model</th>
+                  <th class="py-1.5 text-right font-semibold text-text-muted whitespace-nowrap">In / Out</th>
+                  <th class="py-1.5 pr-3 text-right font-semibold text-text-muted whitespace-nowrap">When</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-border/50 font-mono text-[11px]">
+                {#each stats.recentRequests as req}
+                  <tr class="hover:bg-bg-subtle transition-colors">
+                    <td class="py-1.5 pl-3 align-middle">
+                      <span class="mx-auto block w-1.5 h-1.5 rounded-full {req.status === 'ok' || req.status === 'success' ? 'bg-success' : 'bg-red-500'}"></span>
+                    </td>
+                    <td class="py-1.5 pr-2 min-w-0">
+                      <span class="block truncate font-mono text-[11px]" title={req.model}>{req.model}</span>
+                    </td>
+                    <td class="py-1.5 pr-3 text-right whitespace-nowrap">
+                      <span class="text-primary">{fmt(req.promptTokens)}↑</span>
+                      <span class="text-success">{fmt(req.completionTokens)}↓</span>
+                    </td>
+                    <td class="py-1.5 pr-3 text-right text-text-muted whitespace-nowrap text-[10px]">
+                      {timeAgo(req.timestamp)}
+                    </td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
+      </div>
     </div>
 
     <!-- Token / cost time series, synced to the selected period -->
@@ -557,6 +654,7 @@
       {detailsTotal}
       {detailsPage}
       {detailsLoading}
+      {detailsError}
       onPageChange={loadDetails}
       onRefresh={() => loadDetails(detailsPage)}
       {providerNodes}
