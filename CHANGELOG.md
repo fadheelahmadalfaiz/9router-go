@@ -2,6 +2,152 @@
 
 ## [Unreleased]
 
+### 💀 A retired model fails the request instead of the combo — HTTP 410 now fails over and is badged
+
+When a provider retires a model it answers `HTTP 410 Gone` (`ModelDeprecated`).
+Three things were missing, and an operator had to find all three by reading logs:
+
+1. **The 410 never failed over.** It is in neither `RetryableStatusCodes`
+   (`internal/providers/providers.go:1018`) nor `ErrorRules`
+   (`errorclassify.go:39`), so it fell through the unmatched-4xx branch to
+   `ShouldFallback: false` and locked nothing. A combo led by a dead model
+   spent its whole pass on it.
+2. **Nothing remembered the model was dead.** Every subsequent request redid
+   the discovery, and the dashboard kept listing the model as healthy.
+3. **Nothing told the operator.** No badge, so the only signal was the 410
+   itself.
+
+The status is load-bearing and the payload is a guard. `IsModelDeprecation`
+requires 410 *and* a payload naming the model, because 410 also means an
+expired OAuth device code (`handlers/oauth/device.go:627`) and an expired
+Freebuff session (`proxy/executor/freebuff.go:311`) — badging a model for
+either would blacklist a model that is serving fine.
+
+- `internal/providers/deprecation.go` — `IsModelDeprecation`, `ParseModelDeprecation`, key helpers.
+- `internal/handlers/chat/combo.go` — both combo loops (`handleComboFallback`, `handleMessagesComboFallback`) break to the next entry on a model 410.
+- `internal/handlers/chat/fallback.go` — the single-model path tries the other accounts and keeps the upstream body for a direct request.
+- `internal/handlers/chat/deprecation.go` — records the 410, locks the model 24h, and clears the badge when a request serves again.
+- `internal/db/deprecations.go` — kv-scoped store (`modelDeprecations`), upsert by `<provider>/<model>`.
+- `POST /api/models/sync` — re-reads each connection's upstream catalogue and revives models the provider still lists.
+- `GET /api/models/deprecations` — the badge source, keyed the same way a combo entry is written.
+- Dashboard: `Sync Models` button, per-model `Deprecated` badge with the successor in its tooltip, an "N deprecated" count on the model card, and the marker in the combo model picker.
+
+**A model missing from a catalogue is deliberately not badged.** Catalogues are
+routinely partial — a scoped key, a paginated feed — so absence is weak
+evidence and acting on it would blacklist healthy models. Only a live 410 (or
+a served request, in reverse) changes a badge; a sync can only *revive* one.
+
+**Two defects the end-to-end run caught, both fixed here.** The unit tests
+passed while the running server still failed:
+
+1. **The failover starved the provider it was rescuing.** Excluding the
+   connection from `excludeIDs` looked right — that list is what makes a retry
+   pick a different account — but it spans the whole pass, so on a
+   single-account provider the next combo entry had no account left to try and
+   the client got the 410 anyway: model correctly badged, request still dead.
+   The connection is no longer excluded; the per provider/model lock that
+   `recordModelDeprecation` writes is the scope that matters, and it is what
+   stops the dead model being re-dialled.
+2. **A provider with no catalogue reported a broken sync.** The discovery
+   handler answers 400 for those and sync counted it as a hard failure, so
+   every "Sync Models" click on such a provider returned a 502 with nothing
+   the operator could act on. Those connections now report as `skipped`.
+
+Both are covered by `TestDeprecationFailoverWithSingleAccount` and the sync
+path's `skipped` count.
+
+**Verification:** `go test ./...` and the tagged integration suite
+(`go test -tags=integration ./internal/integration/...`) green; `go vet` clean;
+new table-driven tests cover the classifier (including the two non-model 410s
+that must not badge), the store, the picker's badge propagation, and an
+end-to-end combo failover asserting the client gets the *next* model's response
+plus the recorded deprecation.
+
+Beyond the suite, the feature was driven over real HTTP against the built
+binary with a fake upstream: a combo led by the retired model returned
+**200 `served by qwen3-32b`** instead of the 410, `/api/models/deprecations`
+reported the model `gone` with `successor: qwen3-32b`, and a sync against a
+catalogue still listing the retired model left the badge in place. The
+dashboard was verified in Chromium: the `1 deprecated` count on the model card,
+the `Deprecated` badge on the `ds/deepseek-chat` row carrying the successor in
+its tooltip, and the `Sync Models` button. `bun test` 227/227; `bun run build`
+clean; `bun run ratchet:svelte` 0 unresolved identifiers, 88 errors (baseline
+88, not rising).
+
+
+### 🎛 `Add Anthropic Compatible` / `Add OpenAI Compatible` merged into one dialog that keeps what you typed
+
+The two buttons over Custom Providers opened two separate modals, so choosing
+the wrong protocol was expensive: the user fills name, prefix, suffix and base
+URL, discovers their endpoint actually speaks the other protocol, and has to
+close, reopen the other modal and retype everything.
+
+Both are now a single **Add Custom Provider** button over a dialog that carries a
+Provider Type switch. Switching type keeps every field the user already entered
+and moves only what belongs to the protocol: the base URL follows the new
+default when it still holds the old one, the `API Type` select appears only for
+OpenAI, the id preview updates, and a stale Check result is dropped rather than
+left claiming validity. Picking the wrong protocol is now one click, not a
+retype.
+
+The Custom Embedding dialog (Media Providers) passes `allowedTypes`, so it still
+shows only its own single option.
+
+Also fixed here: the overview button's `onclick` handed its `MouseEvent` to the
+open handler, so the node type reached the backend as `{"isTrusted":false}` and
+the dialog died on `VARIANT_CONFIG[type].defaultBaseUrl` before the base URL was
+ever populated.
+<ours>
+
+### 🐛 `TranslateOpenAIToGemini` dropped tool call ids, so Claude on Antigravity 400'd on any tool history
+
+Every Claude model behind Antigravity (`ag/claude-*`) rejected any request whose
+conversation contained a tool call:
+
+```
+messages.1.content.0.tool_use.id: Field required
+```
+
+The Gemini structs already carried `ID`, but `TranslateOpenAIToGemini` never
+assigned it — neither on `functionCall` (assistant turn) nor on
+`functionResponse` (tool turn). Gemini's own models tolerate a missing id, so
+this only surfaced on Claude: Antigravity hands the Gemini body to Vertex
+Anthropic, which rebuilds a `tool_use` block per `functionCall` and rejects it
+without an id. Combos masked it by silently falling through to the next model.
+
+Upstream sets both (`id: tc.id` / `id: fid` in
+`open-sse/translator/request/openai-to-gemini.js`); this is the matching parity.
+Both sides now carry the id, stripped of the `__ts__<sig>` suffix — that suffix
+is 9router-go's private thought-signature transport and must not reach the wire
+or desynchronise a call from its response.
+
+### 🐛 Edit Compatible Node opens with a blank Prefix field (#177)
+
+`EditCompatibleNodeModal` seeded `name`, `urlSuffix`, `apiType` and `baseUrl` from
+the node but never `prefix`, so the field rendered empty with only its
+`oc-prod` / `ac-prod` placeholder. The stored prefix is the namespace the
+node's models already resolve under (`oc/<model>`), and the submit guard
+requires it, so opening the modal also left Save disabled until the value was
+retyped by hand.
+
+The seed logic now lives in `nodeFormSeed.ts`, which the modal calls for every
+field, with a regression test covering the prefix, the generated-suffix
+exception and the per-flavour default base URL. The `urlSuffixGenerated`
+behaviour is unchanged: a random uuid tail is still not offered as editable
+text.
+
+Verified against a running binary on an isolated `DATA_DIR`: both the OpenAI
+and Anthropic variants open with the stored prefix and an enabled Save, a
+renamed prefix round-trips through `PUT /api/provider-nodes/{id}` and is shown
+again on reopen, and a node whose id tail is a random uuid still opens with an
+empty suffix.
+
+Re-verified against a snapshot of a real 16-node database: every stored prefix
+— including the capitalised and multi-character ones (`Arg`, `Id`, `bai`) —
+opens in the field with Save enabled, a rename round-trips through
+`PUT /api/provider-nodes/{id}` and is shown again on reopen, and a node whose
+id tail is a random uuid still opens with an empty suffix.
+
 ## [v1.9.10] - 2026-10-07
 
 ### 🩺 `text-danger` fails the contrast bar in dark theme — error text is nearly unreadable
