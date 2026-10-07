@@ -599,10 +599,21 @@ export function normalizeConnection(c: ProviderConnection): ProviderConnection {
     } catch {}
   }
   const wire = c as unknown as Record<string, unknown>
-  const specific =
+  const wireSpecific =
+    c.providerSpecificData && typeof c.providerSpecificData === 'object'
+      ? (c.providerSpecificData as Record<string, unknown>)
+      : undefined
+  const parsedSpecific =
     parsed.providerSpecificData && typeof parsed.providerSpecificData === 'object'
       ? (parsed.providerSpecificData as Record<string, unknown>)
-      : parsed
+      : Object.keys(parsed).length > 0
+        ? parsed
+        : undefined
+
+  const specific = {
+    ...(parsedSpecific || {}),
+    ...(wireSpecific || {}),
+  }
   return {
     ...parsed,
     ...c,
@@ -1073,6 +1084,8 @@ export const api = {
   getUsageRequestLogs: (limit = 200) => request<string[]>(`/api/usage/request-logs?limit=${limit}`),
   getRequestDetails: (limit = 50, offset = 0) =>
     request<any>(`/api/usage/request-details?limit=${limit}&offset=${offset}`),
+  /** Full stored payload for one request; the list omits request/response bodies. */
+  getRequestDetail: (id: string) => request<any>(`/api/usage/request-details/${encodeURIComponent(id)}`),
   resetHealth: (provider: string, model?: string) =>
     request<{ status: string }>(`/admin/health/reset?provider=${encodeURIComponent(provider)}${model ? `&model=${encodeURIComponent(model)}` : ''}`, {
       method: 'POST',
