@@ -2,6 +2,157 @@
 
 ## [Unreleased]
 
+### 🐛 fix(web): do not flag active connections as error in provider stats when soft warning or unsupported model probe lastError is present (#207)
+
+### 🔑 issue #199: halaman API Key menyatu ke Endpoint & Key, secret bisa di-reveal lagi
+
+Halaman **Endpoint & Key** sekarang jadi satu-satunya tempat mengelola token klien: tab
+`API Keys` yang duplikat dihapus, dan `ApiKeysTable.svelte` (baru) merender tabel bergaya
+KeiRouter (`mydisha/keirouter`, MIT) — empat kolom `Key | Token | Policy & Created |
+Actions`, tanpa kolom Status dan Created-date terpisah. Status, policy, dan tanggal
+created jadi **satu sel multi-baris**, sesuai permintaan issue. Action bar memakai empat
+kontrol: Policy (modal rate limit/expiry/allowlist), Rotate, Pause/Resume, Delete.
+
+**Tombol show/hide dan copy secret sekarang benar-benar bekerja.** Sebelumnya keduanya
+melakukan sesuatu yang berbeda dari yang dijanjikan UI: `EndpointView` membaca `key.key`,
+padahal sejak F-6 (argon2id) kolom itu berisi sentinel, bukan secret — sehingga show
+"membuka" nilai yang sudah ter-mask, dan copy menyalin mask tersebut.
+
+#### ⚠️ Penyimpanan secret dikembalikan ke plaintext — dan apa risikonya
+
+Issue meminta "matikan hashed stored key". Itu **membalikkan** keputusan F-6 (#176/PR #185,
+3 hari lalu) yang memang sengaja membuat key tidak bisa dibaca ulang. Konsekuensinya nyata
+dan tercatat di sini, bukan disembunyikan:
+
+- `POST /api/keys` dan `POST /api/keys/{id}/rotate` kini menyimpan secret apa adanya di
+  `apiKeys.key`. **Dump database = seluruh key klien terekspos** (DB-02 di
+  `TECHNICAL_DEBT.md` kembali terbuka).
+- `RequireApiKey` tidak lagi *self-heal* — baris plaintext tidak di-hash-kan diam-diam
+  saat dipakai, karena itu akan menghapus tepat properti yang sekarang dashboard andalkan.
+- **Batas yang tetap dijaga:** `GET /api/keys` hanya mengembalikan secret penuh untuk
+  caller dashboard (session cookie, CLI token, atau `requireLogin=false` untuk install
+  lokal). Engine client key — credential yang diberikan ke Cursor/Claude Code — tetap
+  menerima `key` kosong + `keyDisplay` tersamar. Tanpa ini, satu key yang bocor bisa
+  mencuri seluruh key set, persis yang F-6 tutup. Diuji di unit, integration, dan E2E.
+- **Baris lama tidak bisa dipulihkan.** Key yang dibuat sebelum upgrade hanya punya
+  verifier argon2id; plaintext-nya sudah hilang. Daftar mengembalikan `key` kosong dan UI
+  jatuh ke `keyDisplay`. Satu-satunya jalan adalah Rotate.
+
+Alternatif yang ditolak di PR: memakai credential vault AES-256-GCM yang sudah ada
+(F-5) sehingga secret tetap bisa dibaca tanpa menyimpan plaintext. Vault itu butuh
+master key (`ROUTER_MASTER_KEY`) dan tidak ada yang mengaktifkannya secara default,
+sedangkan issue meminta parity penuh dengan upstream `decolua/9router`, yang memang
+menyimpan plaintext.
+
+#### Kesocokan dengan sumber KeiRouter
+
+Acuan visual diambil dari `D:/coding/project/keirouter` (`mydisha/keirouter`, commit
+`3d8b702`, MIT). Yang cocok persis: `StatusPill` (dot + label, bukan badge), urutan
+`Key | Token | ... | Actions`, baris aksi empat kontrol, dan ritme sel multi-baris
+(baris konten dulu, `Created …` muted di bawahnya — `Keys.tsx:193-198`).
+
+Sengaja menyimpang, dan alasannya:
+
+- **Bentuk tabel.** KeiRouter memakai CSS-grid `<article>` tanpa header row sama sekali
+  (`Keys.tsx:178-182`) — tidak ada label kolom yang bisa disalin. Issue #199 minta tabel
+  dengan kolom Status dan Created-date dibuang lalu digabung, jadi header di sini
+  ditetapkan sendiri.
+- **Show/hide & copy.** KeiRouter **tidak punya** tombol eye di UI key — `grep -c Eye
+  frontend/src/pages/Keys.tsx` = 0, dan `adminListKeys` (`admin.go:359-384`) hanya
+  mengembalikan `display` tersamar. Pola ini orisinal untuk issue, bukan tiruan.
+- **Storage.** `crypto/apikey.go:37-39` tegas: *"Plaintext is shown to the user exactly
+  once and never persisted"*. Jadi bagian "matikan hashed stored key" adalah divergensi
+  dari KeiRouter, bukan tiruan — lihat catatan risiko di atas.
+- **Gabungan halaman.** KeiRouter justru memisahkannya: `Endpoints.tsx:132-138` hanya
+  menaut ke `/keys` lewat tombol "Manage keys". Merge di sini mengikuti permintaan issue.
+
+### 🐛 Tombol Refresh per-baris membungkus baris aksi ke dua baris di mobile
+
+Susulan review PR #196 (`feat(connections): per-row refresh button to test a single
+account`, sudah merge). Perubahan yang sama tidak merusak apa pun secara fungsional,
+tetapi memunculkan tiga hal yang tidak terlihat di desktop:
+
+- **Baris aksi membungkus.** Container-nya `grid-cols-3` dan memang berisi tepat tiga
+  sel (proxy / edit / delete). Sel keempat dari tombol Refresh membuat Delete turun ke
+  baris kedua sendiri sementara separuh kanan grid kosong, dan tiap baris koneksi tumbuh
+  ±49px. Diukur di 390px: `gridH` 45px → 93px. Sekarang `grid-flow-col auto-cols-fr`,
+  jadi setiap aksi mendapat satu kolom implisit dan tidak membungkus meski jumlah tombol
+  bertambah — termasuk tombol Session milik Freebuff (lima sel), yang sebelumnya juga
+  membungkus.
+- **Tooltip menyesatkan.** Badge sukses berbunyi `last one-by-one probe passed`, padahal
+  kini juga bisa muncul dari probe per-baris. Sekarang `last probe passed`.
+
+`probeOutcomeFrom`, `probeOutcomeFromError` dan `badgeFor` dipindah ke
+`web/src/components/connections/connectionProbe.ts` beserta `canProbeRow`, sehingga sweep
+dan probe per-baris memakai satu implementasi, dan连锁 badge precedence — yang
+sebelumnya restated di markup — punya test.
+
+### ❌ Yang ditemukan tapi TIDAK diperbaiki: `testStatus` dari Edit modal hilang
+
+Ditemukan saat memverifikasi PR #196, di luar cakupan perubahan ini (backend). Dicatat di
+sini karena menjelaskan batas apa yang benar-benar bisa dilakukan di sisi web.
+
+- **Gejala.** `EditConnectionModal` mengirim `payload.testStatus = 'active'` setelah
+  mengganti credential (`EditConnectionModal.svelte:153`), tapi `HandleUpdateConnection`
+  **tidak pernah membacanya** — `testStatus` tidak ada di allowlist branch `hasData`
+  (`connections.go:635-712`), dan `PUT` tidak menjalankan probe. Diverifikasi langsung:
+  `PUT {apiKey:'sk-fake-1', testStatus:'active'}` menjawab 200, lalu
+  `GET /api/connections` tetap melaporkan `testStatus=error`. Jadi **rotasi key lewat
+  Edit modal tidak pernah mengembalikan baris ke hijau**; satu-satunya jalan adalah
+  *Refresh* per-baris dari PR #196.
+- **Akibatnya.** Badge `error` pada akun yang kredensialnya sudah diperbaiki hanya bisa
+  hilang lewat probe yang benar-benar berjalan. Klaim "entri `failed` bisa basi lalu
+  menutupi `testStatus` yang sudah diperbaiki" **tidak terbukti** dan tidak berlaku di
+  backend ini: tidak ada jalur yang menulis `testStatus='active'` tanpa probe. Karena
+  itu sinkronisasi badge sisi-klien **sengaja tidak** ikut di PR ini — ia akan menambah
+  `$effect` yang menulis state pada setiap render tanpa efek nyata yang bisa dibuktikan.
+- **Perbaikan yang benar ada di backend**, di `HandleUpdateConnection`: terapkan
+  `testStatus` (dan clearing `lastError`) hanya ketika modal sudah memvalidasi key baru,
+  atau jalankan probe bila tidak ada bukti. Itu perubahan handler, bukan UI, dan perlu
+  regression test di `connections_test.go`.
+
+**Verifikasi**: `bun test` 252/252 (21 kasus baru di `connectionProbe.test.ts`, mencakup
+guard sweep PR #196 dan precedence badge), `bun run build` bersih, `svelte-check` ratchet
+88 = baseline dengan 0 unresolved identifier, `go vet ./...` bersih. Grid diukur langsung
+di browser pada 390px dan 1400px: 4 sel satu baris, `gridH` 45px (sebelumnya 93px), dan
+siklus badge `testing` → `active`/`error` masih jalan setelah refactor.
+
+### 🐛 Bug Fixes
+
+- fix(chat): preserve selector cooldown errors in fallback loop instead of returning bare "no available connections" (#201)
+
+### 🐛 Lonjakan RAM idle ~100 MB+ setelah pruning `requestDetails`
+
+- **Gejala**: sejak `db.StartRetentionLoop` masuk (#187, ikut rilis di v1.9.11-exp.1),
+  working set proses melonjak dari ~28 MB ke ~100 MB+ dan tidak pernah kembali,
+  tepat 60 detik setelah boot — durasi `retentionInitialDelay`.
+- **Penyebab**: `cache_size(-64000)` adalah batas **per koneksi**, dan pool dibuka
+  4 koneksi, sehingga plafon page cache SQLite 256 MB. `requestDetails` menyimpan
+  ~20 KB payload per baris; saat retention prune menghapus 20k baris dalam chunk
+  5000, page cache terisi penuh. Halaman yang sudah dibebaskan diserahkan ke OS
+  secara lazy, jadi gateway yang sudah prune sekali menyimpan high-water mark itu
+  seumur proses. Bukan leak Go — `heapAlloc` tetap 0.2 MB sepanjang proses; ini
+  alokasi di layer C (`modernc.org/libc`). Fiks #137 yang menambah prune ini
+  justru memunculkan cacatRAM-nya.
+- **Perbaikan**: `internal/db/client.go` — page cache diturunkan ke 8 MB per
+  koneksi (32 MB total) lewat konstanta `sqliteCacheSizeKB`, dengan
+  `sqliteMaxOpenConns` sebagai konstanta dari mana budget dihitung.
+- **Biaya yang diukur**: fold window 24h di ledger 400k baris (poll dashboard tiap
+  5 detik) 113 ms cold / 35 ms warm pada `-64000`, menjadi 83 ms cold / 72 ms warm
+  pada `-8000` — cold justru lebih cepat karena cache 64 MB harus diisi dulu sebelum
+  hangat. Append tidak terpengaruh (6.1 ms vs 6.7 ms per transaksi 100 baris, di
+  dalam noise). Seek watermark `MAX(timestamp)` tetap 0.0 ms di keduanya karena itu
+  covering-index seek.
+- **Hasil**: binary yang sama, DB yang sama (40k baris × 20 KB), puncak working set
+  setelah prune turun dari **161.6 MB ke 63.4 MB** dan stabil.
+- **Test**: `TestSQLiteCacheSizeCeiling` mengunci plafon 32 MB dan gagal keras bila
+  nilai dikembalikan ke `-64000` (terverifikasi: test gagal dengan
+  "pooled page cache = 252 MB").
+
+### 🐛 Tombol "Add Custom Provider" kembali terpecah di v1.9.11-exp.1
+
+- **Penyebab**: `736136c` — commit pertama PR #185 di branch `feat/keirouter-port`, dibuat 12 menit setelah `079de66` (#183) — menulis ulang `AddCompatibleNodeModal.svelte`, `ConnectionsView.svelte`, `ProvidersOverviewGrid.svelte`, dan `MediaKindView.svelte` ke kondisi sebelum #182/#183, sehingga membatalkan dialog tunggal. Keempat file byte-identik dengan `d729b43` (sebelum penggabungan), terbukti lewat `git rev-parse`. PR #185 sendiri tidak menyentuh fitur ini: revert-nya ikut ter-carry oleh squash merge `9b553e7`.
+- **Perbaikan**: keempat file dipulihkan ke versi unified; `ProvidersOverviewGrid` kembali ke satu tombol **Add Custom Provider** dengan switch Provider Type di dalam dialog (field yang sudah diisi pengguna tetap utuh saat ganti protokol); dialog Custom Embedding tetap `allowedTypes={['custom-embedding']}` sehingga hanya menawarkan satu opsi. Import `AddCompatibleNodeModal` yang tertinggal di `ProviderDetailView.svelte` ikut dibersihkan.
 
 
 ### 🔐 Per-key governance, credential vault, and guardrails (KeiRouter port, Path C)
