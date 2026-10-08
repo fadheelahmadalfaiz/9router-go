@@ -4,7 +4,7 @@
   // lives in tableModel.ts so it stays testable outside a render harness.
   import Badge from '../../lib/ui/Badge.svelte'
   import Card from '../../lib/ui/Card.svelte'
-  import { getIconPath } from '../connections/types'
+  import ProviderArtwork from '../providers/ProviderArtwork.svelte'
   import {
     TABLE_EMPTY_MESSAGE,
     TABLE_STORAGE_KEY,
@@ -174,60 +174,38 @@
             </tr>
           </thead>
           <tbody class="divide-y divide-border/60">
-            {#each groups as group (group.groupKey)}
-              <tr
-                class="cursor-pointer bg-surface-2/40 transition-colors hover:bg-surface-3/60"
-                onclick={() => toggleGroup(group.groupKey)}
-              >
-                {#each columns as column, index (column.field)}
-                  <td
-                    class="px-4 py-3 {column.align === 'right' ? 'text-right' : ''}"
-                    class:pl-4={index === 0}
-                  >
-                    {#if index === 0}
-                      <div class="flex items-center gap-2">
-                        <span
-                          class="material-symbols-outlined text-[18px] text-text-muted transition-transform {expanded.has(
-                            group.groupKey,
-                          )
-                            ? 'rotate-90'
-                            : ''}"
-                        >
-                          chevron_right
-                        </span>
-                        <span
-                          class="truncate font-medium {group.summary.pending > 0
-                            ? 'text-primary'
-                            : 'text-text-main'}"
-                          title={group.groupKey}
-                        >
-                          {group.groupKey}
-                        </span>
-                        {#if group.summary.pending > 0}
-                          <span class="shrink-0 text-[10px] text-primary">
-                            {group.summary.pending} in flight
-                          </span>
-                        {/if}
-                      </div>
-                    {:else if column.identity}
-                      <span class="text-text-muted">—</span>
-                    {:else if column.kind === 'count'}
-                      <span class="font-mono font-semibold text-text-main">
-                        {count(group.summary, column.field)}
-                      </span>
-                    {:else if column.kind === 'time'}
-                      <span class="whitespace-nowrap text-text-muted">
-                        {timeAgo(group.summary.lastUsed)}
-                      </span>
-                    {:else if column.kind === 'money'}
-                      <span class="font-mono font-bold text-warning">
-                        {money(group.summary, column.field)}
-                      </span>
-                    {:else}
-                      <span class="font-mono text-text-main">
-                        {count(group.summary, column.field)}
-                      </span>
+            {#each tableData() as row}
+              <tr class="hover:bg-surface-2/60 transition-colors">
+                <td class="py-3 px-4 font-mono font-medium text-text-main text-xs">
+                  <div class="flex items-center gap-2">
+                    {#if row.provider}
+                      <ProviderArtwork
+                        id={row.provider}
+                        alt={row.provider}
+                        class="w-4 h-4 object-contain rounded shrink-0 bg-surface-2 p-0.5 border border-border/40 text-[9px] leading-none font-semibold"
+                      />
                     {/if}
+                    <span class="truncate">{row.rawModel || row.accountName || row.keyName || row.endpoint || row.key}</span>
+                  </div>
+                </td>
+                <td class="py-3 px-4">
+                  <div class="flex items-center gap-1.5">
+                    {#if row.provider}
+                      <ProviderArtwork
+                        id={row.provider}
+                        alt={row.provider}
+                        class="w-3.5 h-3.5 object-contain rounded shrink-0 text-[9px] leading-none font-semibold"
+                      />
+                    {/if}
+                    <Badge variant="neutral" size="sm">{row.provider || 'unknown'}</Badge>
+                  </div>
+                </td>
+                <td class="py-3 px-4 text-right font-mono font-semibold text-text-main">
+                  {fmt(row.requests)}
+                </td>
+                {#if viewMode === 'costs'}
+                  <td class="py-3 px-4 text-right font-mono font-bold text-warning">
+                    {fmtCost(row.cost)}
                   </td>
                 {/each}
               </tr>
