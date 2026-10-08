@@ -2,6 +2,61 @@
 
 ## [Unreleased]
 
+### 🐛 fix(chat): error model-gated (402 funds, 401 unsupported) tidak mengunci seluruh akun (#218)
+
+- **Latar belakang**: pada provider multi-model seperti OpenCode Zen (atau Antigravity), request ke model
+  berbayar yang gagal (`402 Insufficient account funds`) atau model unsupported (`401 Model ... is not supported`)
+  malah mengunci seluruh akun koneksi via `rateLimitedUntil` selama ~2 menit. Karena loop fallback mencoba
+  seluruh koneksi pada provider tersebut, satu model yang gagal melumpuhkan seluruh akun sehingga model-model
+  gratis/sehat lainnya (`space-bunny-free`, `mimo-v2.6-flash-free`, dll.) ikut mati terkena error 502
+  "no available connections (all in cooldown)".
+- **Akar masalah**: `isModelScopedQuotaError` sebelumnya hanya mencocokkan status 429/403/503 dengan string
+  kuota spesifik. Error 402 dana dan 401 model-unsupported jatuh ke `LockConnectionRateLimit` akun secara global.
+- **Fiks**: `isModelScopedError` diperluas dan di-gate positif: status dibatasi pada 400/401/402/403, body
+  harus menyebutkan nama model yang bersangkutan atau membawa pesan dana ("insufficient account funds"),
+  dan error autentikasi akun asli (invalid API key, token expired, account suspended) tetap mengunci akun
+  secara global. Status 402 juga ditambahkan ke `RetryableStatusCodes`.
+
+### 🐛 Modal policy key: allowlist tidak tampil dan pattern baru tidak tersimpan (Closes #216)
+
+- **Latar belakang**: report #216 — API balas `200 ok`, tapi `model access`
+  di modal policy tidak menyimpan dan tidak menampilkan kembali nilai yang
+  disimpan, dan tombol `load` juga tidak memuat apa pun.
+- **Backend-nya benar, jadi tidak ada perubahan Go.** Direproduksi lewat
+  `app.ProvideRouter` (router produksi, DB SQLite sungguhan): `PUT
+  /api/keys/{id}/models` menulis baris ke `api_key_model_access`, dan `GET
+  /api/keys/{id}/models` membacanya kembali. `resale metadata`, rate limit,
+  dan expiry sudah benar sejak awal — diverifikasi lewat UI, tidak diubah.
+- **Akar masalahnya di `ApiKeyPolicyModal.svelte`, di dua tempat.**
+  1. Allowlist tidak pernah dimuat saat modal dibuka. Listanya dimulai kosong
+     dan baru terisi setelah tombol `Load` ditekan, sehingga untuk key yang
+     sebenarnya dibatasi modal tetap menulis *"every model is allowed"*.
+  2. Tombol **Save Policy** hanya menulis kolom policy; allowlist disimpan lewat
+     endpoint terpisah yang tidak pernah dipanggil dari alur utama. Pattern
+     yang diketik lalu di-`Save` akan diterima `200` lalu hilang.
+  Kedua bug itu saling mengunci: draft kosong dari (1) menimpa daftar yang
+  tersimpan begitu operator menyimpan policy lain.
+- **Fiks**: allowlist diambil saat modal dibuka, dan **Save Policy** sekarang
+  menulis allowlist juga — satu aksi menyimpan satu policy utuh. Tombol `Load`
+  jadi `Reload`, dan `Save allowlist only` dihapus karena sudah tercakup;
+  `saveModels()` dan `isSavingModels` ikut dibersihkan karena tidak ada
+  pemanggilnya lagi.
+- **Penulisan allowlist dikunci sampai daftarnya benar-benar dibaca.** Kalau
+  hanya dilewati saat request berjalan, ada dua keadaan berbeda dengan hasil
+  identik — `models` kosong — dan keduanya berarti "hapus allowlist": request
+  yang masih berjalan, dan request yang **gagal**. Versi pertama hanya menutup
+  yang pertama; pada yang kedua `hasLoadedModels` sempat bernilai true di
+  `finally`, sehingga `Save Policy` menulis daftar kosong di atas daftar yang
+  tersimpan — persis kelas kehilangan data yang sedang diperbaiki di sini.
+  Sekarang penulisan hanya boleh jalan setelah allowlist benar-benar termuat;
+  selain itu simpan ditolak dengan pesan yang menyebut alasannya, dan modal
+  tetap terbuka supaya operator tidak mengira policy utuh sudah tersimpan.
+- **Regresi dijaga** di `internal/integration/keys_policy_test.go`:
+  `TestKeyPolicyRoundTrip`, `TestKeyModelAllowlistRoundTrip`, dan
+  `TestKeyPolicySavePreservesAllowlist` — semuanya membaca ulang lewat router
+  produksi setelah `GET` baru, bukan dari respons write yang selalu sukses.
+  Skor `svelte-check` turun 84 → 83 (`web/scripts/svelte-check-baseline.json`).
+
 ### 🔀 Seluruh `encoding/json` v1 pindah ke `encoding/json/v2`
 
 - **Latar belakang**: repo sudah migrasiMayor ke `encoding/json/v2`, tapi 50
@@ -1411,6 +1466,70 @@ is green; `go test -count=8 -run TestTranscribeGeminiLive ./internal/handlers/me
 is green; 20 consecutive runs of the formerly flaky test are green. The workflow
 file is run by an ubuntu runner (cgo is available there), not a local machine
 without a C compiler.
+
+### 🔒 OAuth refresh singleflight, email masking, & backend test coverage
+
+- **OAuth refresh singleflight**: `refreshOAuthTokenIfExpired` and
+  `forceRefreshOAuthToken` (`internal/handlers/chat/gemini_handler.go`) run
+  inside a `singleflight.Group` keyed per connection, so an expired token costs
+  one upstream round-trip instead of one per concurrent request. The forced
+  refresh uses a `\x00`-prefixed key, which a connection id can never contain,
+  so the two flights cannot collide.
+- **Routing unchanged**: Antigravity-prefixed models (`ag/muse-spark-*`) still
+  route to their owning executor via `routeModelToOwningProvider` in
+  `internal/handlers/chat/resolution.go`.
+- **Email masking**: `web/src/lib/privacy.ts` adds `maskEmail` /
+  `formatEmailLabel` plus an `emailPrivacy` store persisted to
+  `localStorage['9router_mask_email']`, with a toggle in Quota Tracker,
+  Provider Detail, and the Media views so account emails can be hidden while
+  screen sharing. `maskEmail` is idempotent, the store follows the `storage`
+  event so a second window stays in sync, and the toggle also appears in the
+  Model picker, Analytics topology, and the Media header — the tabs that never
+  mount the Providers view and therefore had no way to reach it.
+- **A masked label can never be written back**: the shared
+  `EditConnectionModal` seeds the name field through `formatEmailLabel` and
+  submits `undefined` unless the field differs from both the raw and the
+  masked value. Saving a priority change with masking on leaves the stored
+  name alone instead of persisting `l***m@gmail.com` into
+  `providerConnections.name`.
+- **Backend test coverage**: unit tests added across `config`, `codexquota`,
+  `usagetracker`, `middleware`, `translator`, `app`, `handlerutil`, and `proc`.
+  Measured on this tree: config 90.8 · codexquota 87.3 · usagetracker 87.6 ·
+  middleware 89.2 · translator 85.4 · proc 85.9 are at or above 85%;
+  `handlerutil` 80.2 and `app` 82.1 are not. `internal/proc` also dropped from
+  ~60s to under a second by killing the child process instead of waiting out
+  its lifetime. The two envelope-unwrap tests assert the envelope key is
+  gone, so they fail when the unwrap is a no-op.
+
+**Regression coverage added with this change:** an unexpired token must return
+the caller's own token, and a waiter sharing a collapsed flight must not be
+handed the leader's. Both are new — no test previously sent a connection whose
+`apiKey` differs from its `accessToken`, which is exactly the iFlow shape
+(HMAC platform key plus a separate OAuth token), and that gap is why a token
+substitution in this path passed the full suite while signing iFlow requests
+with the wrong secret.
+
+**Found while reviewing this change, and fixed here.** Each was proven by
+reverting the fix and watching the test fail, not by inspection:
+
+- **A refresher returning no result crashed the gateway.** The lazy path
+  passed the result straight to `BuildConnectionUpdate`, which dereferences it;
+  the forced path already guarded this shape. A provider reporting success
+  with no token therefore panicked — and singleflight re-panicked that on
+  every waiter instead of returning an error.
+- **The write-back guard compared against a freshly derived mask.** Toggling
+  masking in a second window while the modal was open made the untouched
+  masked field compare as a rename, and persisted `l***m@gmail.com`. The
+  comparison is now against the value the field opened with, in
+  `submittedConnectionName`, with both sides trimmed so a stored name padded
+  with whitespace still matches.
+- **A Gemini turn carrying only a tool result skipped the name fit.** The
+  quick-check token list named `functionCall` but not `functionResponse`, so a
+  history-only turn returned unshortened while the declaration beside it was
+  fitted.
+- **`maskEmail` was never tested with two addresses in one label.** The regex
+  is global; dropping `/g` left the second address in the clear and the suite
+  green.
 
 Job baru `race` menjalankan `go test -race -count=1 -timeout 10m ./...`.
 Dipisah dari job `test`, bukan menambah step, supaya laporan race bernama sendiri

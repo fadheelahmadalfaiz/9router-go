@@ -28,7 +28,7 @@
   import RequestDetailsTab from './RequestDetailsTab.svelte'
   import RequestLogsView from './RequestLogsView.svelte'
   import ProviderTopologyCard from './ProviderTopologyCard.svelte'
-
+  import { emailPrivacy, formatEmailLabel } from '../../lib/privacy'
   interface Props {
     connections?: ProviderConnection[]
     providerNodes?: ProviderNode[]
@@ -269,36 +269,20 @@
     }
   })
 
-  // Back/forward across filter changes: App.svelte only re-reads the pathname,
-  // so the query string is applied here.
-  onMount(() => {
-    window.addEventListener('popstate', restoreUrlState)
-    return () => window.removeEventListener('popstate', restoreUrlState)
-  })
-  let topologyProviders = $derived.by<TopologyProvider[]>(() =>
-    buildTopologyProviders({
-      connections,
-      providerNodes,
-      activeRequests,
-      recentRequests: stats.recentRequests || [],
-      pulseProvider,
-      lastProvider,
-      errorProvider,
-      byProvider: stats.byProvider,
-    }),
-  )
-
-  // ─── URL state sync ────────────────────────────────────────────────────────
-  function syncUrl(nextState: UsageUrlState): void {
-    if (typeof window === 'undefined') return
-    // Only ever touch the analytics route; other tabs own their own URLs.
-    if (pathToTab(window.location.pathname) !== 'analytics') return
-
-    const search = buildUsageUrl(nextState, window.location.search)
-    if (search === window.location.search) return
-
-    const url = `${window.location.pathname}${search}`
-    window.history.replaceState({ tab: 'analytics', usage: nextState }, '', url)
+  function topologyName(providerId: string, fallbackName?: string): string {
+    // The fallback is a connection name, and for OAuth connections that is
+    // the account email — mask it the same way the connection lists do.
+    const nodeName = formatEmailLabel(nodeNameById.get(providerId) ?? '', $emailPrivacy)
+    if (nodeName) return nodeName
+    const cat = PROVIDER_CATALOG.find((p) => p.id === providerId || p.alias === providerId)
+    if (cat?.name) return cat.name
+    if (fallbackName && fallbackName !== providerId) {
+      // Numeric key names (e.g. "12") are connection labels, not provider names —
+      // fall back to the raw provider id so custom nodes never render as "12".
+      if (!/^\d+$/.test(fallbackName.trim())) return formatEmailLabel(fallbackName, $emailPrivacy)
+      return providerId
+    }
+    return providerId
   }
 
   let topologyProviders = $derived.by(() => {

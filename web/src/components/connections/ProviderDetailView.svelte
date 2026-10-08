@@ -1123,7 +1123,7 @@
   }
 
   async function handleDeleteConnection(conn: ProviderConnection) {
-    if (!confirm(`Delete connection "${conn.name || conn.id}"? This cannot be undone.`)) return
+    if (!confirm(`Delete connection "${formatEmailLabel(conn.name || conn.id, $emailPrivacy)}"? This cannot be undone.`)) return
     try {
       await api.deleteConnection(conn.id)
       onRefresh()
@@ -3011,7 +3011,7 @@
           {/if}
           {#if isTestingOneByOne && oneByOneCurrentId}
             <span>
-              Running: {providerConnections.find((conn) => conn.id === oneByOneCurrentId)?.name || oneByOneCurrentId}
+              Running: {formatEmailLabel(providerConnections.find((conn) => conn.id === oneByOneCurrentId)?.name || oneByOneCurrentId, $emailPrivacy)}
             </span>
           {/if}
         </div>
