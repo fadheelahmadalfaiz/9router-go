@@ -15,6 +15,8 @@ export interface ProviderConnection {
   apiKeyMasked?: string
   testStatus?: string | null
   lastError?: string | null
+  lastErrorModel?: string | null
+  lastErrorSource?: 'chat' | null
   displayName?: string | null
   assignedModel?: string | null
   providerSpecificData?: { assignedModel?: string | null; [key: string]: unknown }
@@ -39,6 +41,7 @@ export interface ModelCaps {
   maxOutput: number
   /** Selectable thinking levels, or empty for a model without reasoning. */
   thinkingLevels: string[]
+  free?: boolean
 }
 
 /**
@@ -92,6 +95,8 @@ export interface APIKeyPolicy {
   rateLimitConcurrency?: number
   expiresAt?: string
   metadata?: string
+  /** Renames the key. An empty string clears the stored name. */
+  name?: string
 }
 
 export interface GuardrailPolicy {
@@ -180,8 +185,7 @@ export interface Settings {
   samlLoginLabel?: string
   samlAttributeEmail?: string
   samlAttributeName?: string
-  /** Language, routing and network preferences (profile page). */
-  language?: string
+  /** Routing and network preferences (profile page). */
   fallbackStrategy?: string
   comboStrategy?: string
   stickyRoundRobinLimit?: number
@@ -836,6 +840,8 @@ export function normalizeConnection(c: ProviderConnection): ProviderConnection {
     rateLimitedUntil: stringField(parsed, 'rateLimitedUntil') ?? stringField(wire, 'rateLimitedUntil'),
     testStatus: stringField(wire, 'testStatus') || stringField(parsed, 'testStatus'),
     expiresAt: stringField(parsed, 'expiresAt'),
+    lastErrorModel: stringField(parsed, 'lastErrorModel') ?? stringField(wire, 'lastErrorModel'),
+    lastErrorSource: stringField(parsed, 'lastErrorSource') ?? stringField(wire, 'lastErrorSource'),
   } as ProviderConnection
 }
 
@@ -1141,7 +1147,7 @@ export const api = {
    * for a plain LLM model.
    */
   testModel: (model: string, kind?: string) =>
-    request<{ ok: boolean; error?: string; note?: string; latencyMs?: number; status?: number }>('/api/models/test', {
+    request<{ ok: boolean; error?: string; note?: string; latencyMs?: number; status?: number; blocked?: boolean; resetAt?: string }>('/api/models/test', {
       method: 'POST',
       body: JSON.stringify({ model, kind }),
     }),
