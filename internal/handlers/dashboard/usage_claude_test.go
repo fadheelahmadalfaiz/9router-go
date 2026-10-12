@@ -1,450 +1,201 @@
 package dashboard
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// Claude quota port of open-sse/services/usage/claude.js. Before this there was
-// no claude case in fetchProviderUsage, so every Claude Code account answered
-// the empty lock fallback and the tracker showed no quota at all.
+// withClaudeUsageServer points the fetcher at a stub and resets the per-token
+// state so tests do not see each other's cache.
+func withClaudeUsageServer(t *testing.T, handler http.HandlerFunc) *int32 {
+	t.Helper()
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		handler(w, r)
+	}))
+	prev := claudeUsageURL
+	claudeUsageURL = srv.URL
+	claudeUsageMu.Lock()
+	claudeUsageState = map[string]*claudeUsageEntry{}
+	claudeUsageMu.Unlock()
+	t.Cleanup(func() {
+		claudeUsageURL = prev
+		srv.Close()
+	})
+	return &calls
+}
 
-const claudeOAuthPayload = `{
-  "five_hour": {"utilization": 29, "resets_at": "2030-01-01T00:00:00Z"},
-  "seven_day": {"utilization": 4, "resets_at": 1893456000},
-  "seven_day_opus": {"utilization": 96},
-  "extra_usage": {"enabled": true}
+const claudeUsageBody = `{
+	"five_hour":  {"utilization": 87, "resets_at": "2026-10-11T20:00:00Z"},
+	"seven_day":  {"utilization": 12.5, "resets_at": "2026-10-17T10:00:00Z"},
+	"seven_day_opus": {"utilization": 40, "resets_at": "2026-10-17T10:00:00Z"},
+	"seven_day_oauth_apps": null,
+	"limits": [
+		{"kind": "weekly_scoped", "percent": 33, "resets_at": "2026-10-17T10:00:00Z",
+		 "scope": {"model": {"display_name": "Fable"}}},
+		{"kind": "session", "percent": 90}
+	]
 }`
 
-// clearClaudeUsageState wipes the per-token cache and cooldown maps. They are
-// process-wide by design, so a test that seeds a token has to leave it clean.
-func clearClaudeUsageState() {
-	claudeCacheMu.Lock()
-	claudeCache = map[string]claudeCacheEntry{}
-	claudeCacheMu.Unlock()
-	claudeCoolMu.Lock()
-	claudeCool = map[string]time.Time{}
-	claudeCoolMu.Unlock()
-}
+func TestFetchClaudeUsage_RendersWindows(t *testing.T) {
+	withClaudeUsageServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer tok-render" {
+			t.Errorf("Authorization = %q", got)
+		}
+		if r.Header.Get("anthropic-beta") != claudeUsageBeta {
+			t.Errorf("anthropic-beta = %q", r.Header.Get("anthropic-beta"))
+		}
+		if !strings.HasPrefix(r.Header.Get("User-Agent"), "claude-cli/") {
+			t.Errorf("User-Agent = %q", r.Header.Get("User-Agent"))
+		}
+		_, _ = w.Write([]byte(claudeUsageBody))
+	})
 
-func resetClaudeUsageState(t *testing.T) {
-	t.Helper()
-	clearClaudeUsageState()
-	t.Cleanup(clearClaudeUsageState)
-}
-
-// utilization is a percentage USED, so 29/100 must render as 71% remaining.
-// Reading the field as a remaining value doubles the reported usage.
-func TestFetchClaudeUsage_UtilizationIsPercentUsed(t *testing.T) {
-	resetClaudeUsageState(t)
-	withClaudeOAuthServer(t, http.StatusOK, claudeOAuthPayload)
-
-	res := fetchClaudeUsage(t.Context(), "tok", false)
+	res := fetchClaudeUsage(t.Context(), "tok-render")
 	if res.message != "" {
-		t.Fatalf("unexpected message: %q", res.message)
+		t.Fatalf("unexpected message %q", res.message)
 	}
 	if res.plan != "Claude Code" {
-		t.Errorf("plan = %q, want %q", res.plan, "Claude Code")
+		t.Errorf("plan = %q", res.plan)
 	}
-
-	session := claudeRow(t, res, "session (5h)")
-	claudeAssertNum(t, session, "used", 29)
-	claudeAssertNum(t, session, "total", 100)
-	claudeAssertNum(t, session, "remaining", 71)
-	claudeAssertNum(t, session, "remainingPercentage", 71)
-	if got := claudeRowResetAt(session); got != "2030-01-01T00:00:00Z" {
-		t.Errorf("session resetAt = %q, want the ISO value", got)
+	want := map[string]float64{
+		"session (5h)":      87,
+		"weekly (7d)":       12.5,
+		"weekly opus (7d)":  40,
+		"weekly fable (7d)": 33,
 	}
-
-	// A unix-seconds reset has to come back as RFC3339, not as a raw number.
-	weekly := claudeRow(t, res, "weekly (7d)")
-	claudeAssertNum(t, weekly, "used", 4)
-	claudeAssertNum(t, weekly, "remainingPercentage", 96)
-	if got := claudeRowResetAt(weekly); got != "2030-01-01T00:00:00Z" {
-		t.Errorf("weekly resetAt = %q, want the unix seconds converted", got)
+	if len(res.quotas) != len(want) {
+		t.Fatalf("got %d rows (%v), want %d", len(res.quotas), res.quotas, len(want))
 	}
-}
-
-// seven_day_<model> windows become their own rows; a window without a numeric
-// utilization is skipped rather than rendered as 0% used.
-func TestFetchClaudeUsage_ModelSpecificWeeklyWindows(t *testing.T) {
-	resetClaudeUsageState(t)
-	withClaudeOAuthServer(t, http.StatusOK, `{
-	  "seven_day": {"utilization": 4},
-	  "seven_day_opus": {"utilization": 96},
-	  "seven_day_opus_plan_mode": {"resets_at": "2030-01-01T00:00:00Z"},
-	  "extra_usage": null
-	}`)
-
-	res := fetchClaudeUsage(t.Context(), "tok", false)
-	row := claudeRow(t, res, "weekly opus (7d)")
-	claudeAssertNum(t, row, "used", 96)
-	claudeAssertNum(t, row, "remaining", 4)
-	if _, exists := res.quotas["weekly opus plan mode (7d)"]; exists {
-		t.Errorf("a window without utilization must not become a row: %v", res.quotas)
-	}
-	if _, exists := res.quotas["weekly  (7d)"]; exists {
-		t.Errorf("the bare seven_day window must not be duplicated: %v", res.quotas)
-	}
-}
-
-// Anthropic 429s the quota endpoint well before it 429s chat, so a read inside
-// the TTL must be served from cache instead of hitting the network again.
-func TestFetchClaudeUsage_CachesByToken(t *testing.T) {
-	resetClaudeUsageState(t)
-
-	var mu sync.Mutex
-	calls := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		calls++
-		mu.Unlock()
-		_, _ = w.Write([]byte(claudeOAuthPayload))
-	}))
-	t.Cleanup(srv.Close)
-	withClaudeURLs(t, srv.URL, srv.URL, srv.URL)
-
-	first := fetchClaudeUsage(t.Context(), "tok", false)
-	second := fetchClaudeUsage(t.Context(), "tok", false)
-	if len(first.quotas) == 0 || len(second.quotas) == 0 {
-		t.Fatalf("expected quota rows on both reads: %v / %v", first.quotas, second.quotas)
-	}
-	mu.Lock()
-	got := calls
-	mu.Unlock()
-	if got != 1 {
-		t.Errorf("provider was called %d times, want 1 (second read served from cache)", got)
-	}
-
-	// A manual refresh must actually re-read.
-	fetchClaudeUsage(t.Context(), "tok", true)
-	mu.Lock()
-	got = calls
-	mu.Unlock()
-	if got != 2 {
-		t.Errorf("provider was called %d times after a forced refresh, want 2", got)
-	}
-}
-
-// The tracker refreshes every visible connection each tick, so concurrent
-// readers of the same token have to collapse onto one upstream request.
-func TestFetchClaudeUsage_CollapsesConcurrentReaders(t *testing.T) {
-	resetClaudeUsageState(t)
-
-	var mu sync.Mutex
-	calls := 0
-	release := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		calls++
-		mu.Unlock()
-		<-release
-		_, _ = w.Write([]byte(claudeOAuthPayload))
-	}))
-	t.Cleanup(srv.Close)
-	withClaudeURLs(t, srv.URL, srv.URL, srv.URL)
-
-	results := make([]usageResult, 6)
-	var wg sync.WaitGroup
-	for i := range results {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results[i] = fetchClaudeUsage(t.Context(), "tok", false)
-		}()
-	}
-	// Give the goroutines time to pile up on the in-flight call.
-	time.Sleep(50 * time.Millisecond)
-	close(release)
-	wg.Wait()
-
-	mu.Lock()
-	got := calls
-	mu.Unlock()
-	if got != 1 {
-		t.Errorf("provider was called %d times, want 1 for %d concurrent readers", got, len(results))
-	}
-	for i, res := range results {
-		if len(res.quotas) == 0 {
-			t.Errorf("reader %d got no quota rows: %q", i, res.message)
+	for name, used := range want {
+		row := codexQuotaRow(t, res, name)
+		if got := codexNumber(t, row, "used"); got != used {
+			t.Errorf("%s used = %v, want %v", name, got, used)
+		}
+		if got := codexNumber(t, row, "remaining"); got != 100-used {
+			t.Errorf("%s remaining = %v, want %v", name, got, 100-used)
+		}
+		if got := codexNumber(t, row, "total"); got != 100 {
+			t.Errorf("%s total = %v, want 100", name, got)
 		}
 	}
-}
-
-// A soft failure must not overwrite a good read on screen.
-func TestFetchClaudeUsage_KeepsLastGoodReadOnSoftFailure(t *testing.T) {
-	resetClaudeUsageState(t)
-
-	var mu sync.Mutex
-	calls := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		calls++
-		n := calls
-		mu.Unlock()
-		if n == 1 {
-			_, _ = w.Write([]byte(claudeOAuthPayload))
-			return
-		}
-		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	t.Cleanup(srv.Close)
-	withClaudeURLs(t, srv.URL, srv.URL, srv.URL)
-
-	first := fetchClaudeUsage(t.Context(), "tok", false)
-	if len(first.quotas) == 0 {
-		t.Fatalf("expected quota rows on the first read: %q", first.message)
-	}
-
-	forced := fetchClaudeUsage(t.Context(), "tok", true)
-	if len(forced.quotas) == 0 {
-		t.Errorf("a 429 replaced the good read with a message: %q", forced.message)
+	if got := codexQuotaRow(t, res, "session (5h)")["resetAt"]; got != "2026-10-11T20:00:00Z" {
+		t.Errorf("session resetAt = %v", got)
 	}
 }
 
-// A 429 on the OAuth endpoint cools that token down and drops it on the org
-// path, instead of retrying the endpoint that just refused.
-func TestFetchClaudeUsage_429CoolsDownAndUsesOrgPath(t *testing.T) {
-	resetClaudeUsageState(t)
-
-	var mu sync.Mutex
-	oauthCalls, settingsCalls := 0, 0
-	mux := http.NewServeMux()
-	// One catch-all: the org id lands in the path, so routing on a fixed
-	// pattern would miss it.
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		switch {
-		case strings.HasPrefix(r.URL.Path, "/oauth/usage"):
-			oauthCalls++
-			mu.Unlock()
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{}`))
-		case strings.HasPrefix(r.URL.Path, "/settings"):
-			settingsCalls++
-			mu.Unlock()
-			_, _ = w.Write([]byte(`{"organization_id":"org 1","organization_name":"Acme","plan":"max"}`))
-		default:
-			mu.Unlock()
-			if got := r.URL.EscapedPath(); got != "/org/org%201/usage" {
-				t.Errorf("org id was not escaped into the path: %q", got)
-			}
-			_, _ = w.Write([]byte(`{"session_5h":{"used":3,"total":100}}`))
-		}
+func TestFetchClaudeUsage_ClampsUtilization(t *testing.T) {
+	withClaudeUsageServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":140},"seven_day":{"utilization":-3}}`))
 	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	withClaudeURLs(t, srv.URL+"/oauth/usage", srv.URL+"/settings", srv.URL+"/org/%s/usage")
-
-	first := fetchClaudeUsage(t.Context(), "tok", false)
-	if first.plan != "max" {
-		t.Errorf("plan = %q, want %q from the settings endpoint", first.plan, "max")
+	res := fetchClaudeUsage(t.Context(), "tok-clamp")
+	if got := codexNumber(t, codexQuotaRow(t, res, "session (5h)"), "remaining"); got != 0 {
+		t.Errorf("remaining = %v, want 0", got)
 	}
-	if len(first.quotas) == 0 {
-		t.Fatalf("expected org quota rows, got %q", first.message)
+	if got := codexNumber(t, codexQuotaRow(t, res, "weekly (7d)"), "used"); got != 0 {
+		t.Errorf("used = %v, want 0", got)
 	}
-	orgRow, ok := first.quotas["session_5h"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected the org usage payload to pass through, got %v", first.quotas)
-	}
-	claudeAssertNum(t, orgRow, "used", 3)
-
-	// Inside the cooldown the OAuth endpoint must not be tried again.
-	fetchClaudeUsage(t.Context(), "tok", true)
-	mu.Lock()
-	gotOAuth, gotSettings := oauthCalls, settingsCalls
-	mu.Unlock()
-	if gotOAuth != 1 {
-		t.Errorf("oauth endpoint was called %d times, want 1 (cooldown should suppress it)", gotOAuth)
-	}
-	if gotSettings < 2 {
-		t.Errorf("org path was used %d times, want it to take over from the oauth endpoint", gotSettings)
+	if codexQuotaRow(t, res, "session (5h)")["resetAt"] != nil {
+		t.Errorf("missing resets_at must render as nil")
 	}
 }
 
-func TestFetchClaudeUsage_LegacyWithoutAdminAccess(t *testing.T) {
-	resetClaudeUsageState(t)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/oauth/usage", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
+func TestFetchClaudeUsage_NoWindows(t *testing.T) {
+	withClaudeUsageServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"five_hour":null,"seven_day":null}`))
 	})
-	mux.HandleFunc("/settings", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"plan":"pro"}`))
-	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	withClaudeURLs(t, srv.URL+"/oauth/usage", srv.URL+"/settings", srv.URL+"/org/%s/usage")
-
-	res := fetchClaudeUsage(t.Context(), "tok", false)
-	if !strings.Contains(res.message, "require admin access") {
-		t.Errorf("message = %q, want it to name the admin requirement", res.message)
-	}
-	if res.plan != "pro" {
-		t.Errorf("plan = %q, want pro", res.plan)
-	}
-	if len(res.quotas) != 0 {
-		t.Errorf("expected no quota rows, got %v", res.quotas)
-	}
-}
-
-func TestFetchClaudeUsage_SettingsRejected(t *testing.T) {
-	resetClaudeUsageState(t)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/oauth/usage", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-	})
-	mux.HandleFunc("/settings", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	withClaudeURLs(t, srv.URL+"/oauth/usage", srv.URL+"/settings", srv.URL+"/org/%s/usage")
-
-	res := fetchClaudeUsage(t.Context(), "tok", false)
-	if !strings.Contains(res.message, "requires admin permissions") {
-		t.Errorf("message = %q, want it to name the permission problem", res.message)
+	res := fetchClaudeUsage(t.Context(), "tok-empty")
+	if len(res.quotas) != 0 || res.message == "" {
+		t.Fatalf("expected a message and no rows, got %+v", res)
 	}
 }
 
 func TestFetchClaudeUsage_RequiresToken(t *testing.T) {
-	resetClaudeUsageState(t)
-	res := fetchClaudeUsage(t.Context(), "  ", false)
-	if !strings.Contains(res.message, "access token not available") {
-		t.Errorf("message = %q, want it to name the missing token", res.message)
+	res := fetchClaudeUsage(t.Context(), "  ")
+	if res.message == "" || len(res.quotas) != 0 {
+		t.Fatalf("expected a message, got %+v", res)
+	}
+}
+
+// A 401 must read as an expired credential so the handler refreshes it and
+// reads once more (isAuthExpiredUsageMessage).
+func TestFetchClaudeUsage_UnauthorizedTriggersRefreshPath(t *testing.T) {
+	withClaudeUsageServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	res := fetchClaudeUsage(t.Context(), "tok-401")
+	if !isAuthExpiredUsageMessage(res) {
+		t.Fatalf("message %q is not recognised as auth-expired", res.message)
+	}
+}
+
+func TestFetchClaudeUsage_CachesSuccessfulReads(t *testing.T) {
+	calls := withClaudeUsageServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(claudeUsageBody))
+	})
+	for i := 0; i < 3; i++ {
+		fetchClaudeUsage(t.Context(), "tok-cache")
+	}
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Errorf("upstream calls = %d, want 1", got)
+	}
+}
+
+func TestFetchClaudeUsage_429CoolsDownAndServesStale(t *testing.T) {
+	var limited atomic.Bool
+	calls := withClaudeUsageServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if limited.Load() {
+			w.Header().Set("Retry-After", "30")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(claudeUsageBody))
+	})
+	fetchClaudeUsage(t.Context(), "tok-429")
+
+	// Age the cached reading out, then rate-limit upstream.
+	claudeUsageUpdate(claudeUsageKey("tok-429"), func(e *claudeUsageEntry) { e.expiresAt = time.Now().Add(-time.Second) })
+	limited.Store(true)
+
+	res := fetchClaudeUsage(t.Context(), "tok-429")
+	if _, ok := res.quotas["session (5h)"]; !ok {
+		t.Fatalf("a 429 must keep the last good reading, got %+v", res)
+	}
+	before := atomic.LoadInt32(calls)
+	fetchClaudeUsage(t.Context(), "tok-429")
+	if got := atomic.LoadInt32(calls); got != before {
+		t.Errorf("token was asked again during cooldown (%d -> %d calls)", before, got)
+	}
+}
+
+func TestFetchClaudeUsage_429WithoutHistoryIsBareMessage(t *testing.T) {
+	withClaudeUsageServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	res := fetchClaudeUsage(t.Context(), "tok-429-cold")
+	if res.message == "" || len(res.quotas) != 0 || !res.bare {
+		t.Fatalf("expected a bare message, got %+v", res)
 	}
 }
 
 func TestFetchProviderUsage_DispatchesClaude(t *testing.T) {
-	resetClaudeUsageState(t)
-	withClaudeOAuthServer(t, http.StatusOK, claudeOAuthPayload)
-
-	res, ok := fetchProviderUsage(t.Context(), "claude", map[string]any{"accessToken": "tok"}, false)
+	withClaudeUsageServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(claudeUsageBody))
+	})
+	res, ok := fetchProviderUsage(t.Context(), "claude", map[string]any{"accessToken": "tok-dispatch"})
 	if !ok {
 		t.Fatal("expected fetchProviderUsage to handle claude")
 	}
 	if _, has := res.quotas["session (5h)"]; !has {
-		t.Errorf("expected a session (5h) row, got %v", res.quotas)
+		t.Errorf("expected a session row, got %v", res.quotas)
 	}
-}
-
-// End-to-end through the dashboard route, including the ?force=1 the per-row
-// refresh button sends.
-func TestHandleGetConnectionUsage_ClaudeReturnsRealQuota(t *testing.T) {
-	fastQuotaGate(t)
-	resetClaudeUsageState(t)
-
-	var mu sync.Mutex
-	calls := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		calls++
-		mu.Unlock()
-		_, _ = w.Write([]byte(claudeOAuthPayload))
-	}))
-	t.Cleanup(srv.Close)
-	withClaudeURLs(t, srv.URL, srv.URL, srv.URL)
-
-	repo, cleanup := setupTestDB(t)
-	t.Cleanup(cleanup)
-	if err := repo.CreateProviderConnectionFull(
-		"cc-1", "claude", "oauth", "cc-1", nil, `{"accessToken":"tok"}`,
-	); err != nil {
-		t.Fatalf("seed connection: %v", err)
+	out := res.toResponse()
+	if q, _ := out["quotas"].(map[string]any); len(q) == 0 {
+		t.Errorf("response must carry the quota rows, got %v", out)
 	}
-	router := setupTestRouter(repo)
-
-	read := func(url string) map[string]any {
-		t.Helper()
-		rec := httptest.NewRecorder()
-		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, url, nil))
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body.String())
-		}
-		var body map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-			t.Fatalf("decode %s: %v", rec.Body.String(), err)
-		}
-		return body
-	}
-
-	body := read("/api/usage/cc-1")
-	quotas, ok := body["quotas"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected a quotas object, got %v", body)
-	}
-	row, ok := quotas["session (5h)"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected a session (5h) row, got %v", quotas)
-	}
-	claudeAssertNum(t, row, "used", 29)
-	claudeAssertNum(t, row, "remainingPercentage", 71)
-
-	// The per-row refresh button sends ?force=1 and must re-read upstream.
-	read("/api/usage/cc-1?force=1")
-	mu.Lock()
-	got := calls
-	mu.Unlock()
-	if got != 2 {
-		t.Errorf("provider was called %d times, want 2 (force=1 must bypass the cache)", got)
-	}
-}
-
-// ---------- helpers ----------
-
-func withClaudeURLs(t *testing.T, oauthURL, settingsURL, orgUsageURL string) {
-	t.Helper()
-	prevOAuth, prevSettings, prevOrg := claudeOAuthUsageURL, claudeSettingsURL, claudeOrgUsageURL
-	claudeOAuthUsageURL, claudeSettingsURL, claudeOrgUsageURL = oauthURL, settingsURL, orgUsageURL
-	t.Cleanup(func() {
-		claudeOAuthUsageURL, claudeSettingsURL, claudeOrgUsageURL = prevOAuth, prevSettings, prevOrg
-	})
-}
-
-func withClaudeOAuthServer(t *testing.T, status int, body string) {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "Bearer tok" {
-			t.Errorf("Authorization = %q, want %q", got, "Bearer tok")
-		}
-		if got := r.Header.Get("anthropic-beta"); got != "oauth-2025-04-20" {
-			t.Errorf("anthropic-beta = %q, want the oauth beta header", got)
-		}
-		w.WriteHeader(status)
-		_, _ = w.Write([]byte(body))
-	}))
-	t.Cleanup(srv.Close)
-	withClaudeURLs(t, srv.URL, srv.URL+"/settings", srv.URL+"/organizations/%s/usage")
-}
-
-func claudeRow(t *testing.T, res usageResult, key string) map[string]any {
-	t.Helper()
-	row, ok := res.quotas[key].(map[string]any)
-	if !ok {
-		t.Fatalf("expected a %q row, got %v", key, res.quotas)
-	}
-	return row
-}
-
-func claudeAssertNum(t *testing.T, row map[string]any, key string, want float64) {
-	t.Helper()
-	got, ok := row[key].(float64)
-	if !ok {
-		t.Fatalf("expected numeric %q, got %v (%T)", key, row[key], row[key])
-	}
-	if got != want {
-		t.Errorf("%s = %v, want %v", key, got, want)
-	}
-}
-
-func claudeRowResetAt(row map[string]any) string {
-	s, _ := row["resetAt"].(string)
-	return s
 }
