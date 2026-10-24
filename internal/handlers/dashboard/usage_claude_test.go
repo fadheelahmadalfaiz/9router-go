@@ -187,7 +187,7 @@ func TestFetchProviderUsage_DispatchesClaude(t *testing.T) {
 	withClaudeUsageServer(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(claudeUsageBody))
 	})
-	res, ok := fetchProviderUsage(t.Context(), "claude", map[string]any{"accessToken": "tok-dispatch"})
+	res, ok := fetchProviderUsage(t.Context(), "claude", map[string]any{"accessToken": "tok-dispatch"}, false)
 	if !ok {
 		t.Fatal("expected fetchProviderUsage to handle claude")
 	}

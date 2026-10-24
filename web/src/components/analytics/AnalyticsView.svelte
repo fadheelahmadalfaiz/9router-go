@@ -28,6 +28,9 @@
   import RequestDetailsTab from './RequestDetailsTab.svelte'
   import RequestLogsView from './RequestLogsView.svelte'
   import ProviderTopologyCard from './ProviderTopologyCard.svelte'
+  import UsageChart from './charts/UsageChart.svelte'
+  import ProviderBarChart from './charts/ProviderBarChart.svelte'
+  import TopModelsChart from './charts/TopModelsChart.svelte'
   import { emailPrivacy, formatEmailLabel } from '../../lib/privacy'
   interface Props {
     connections?: ProviderConnection[]

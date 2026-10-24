@@ -100,6 +100,24 @@ func fetchProviderUsage(ctx context.Context, provider string, data map[string]an
 		return fetchOpenCodeZenUsage(ctx, apiKey, connectionBaseURL(data)), true
 	case "minimax-code", "minimax-code-global":
 		return fetchMiniMaxCodeUsage(ctx, provider, accessToken, psdStr(psd, "realUserID")), true
+	case "glm", "glm-cn":
+		return fetchGlmUsage(ctx, apiKey, provider), true
+	case "minimax", "minimax-cn":
+		return fetchMiniMaxUsage(ctx, firstNonEmptyStr(apiKey, accessToken), provider), true
+	case "github":
+		return fetchGitHubUsage(ctx, accessToken), true
+	case "gemini-cli":
+		return fetchGeminiCLIUsage(ctx, accessToken, psd), true
+	case "kimi":
+		return fetchKimiUsage(ctx, accessToken, apiKey, psd), true
+	case "zed":
+		return fetchZedUsage(ctx, accessToken, psd), true
+	case "freebuff":
+		return fetchFreebuffUsage(ctx, accessToken), true
+	case "vercel-ai-gateway":
+		return fetchVercelCredits(ctx, apiKey), true
+	case "iflow":
+		return fetchIflowUsage(ctx), true
 	default:
 		return usageResult{}, false
 	}
