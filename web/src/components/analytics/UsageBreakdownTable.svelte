@@ -1,176 +1,251 @@
 <script lang="ts">
-  // Sortable, group/expandable usage breakdown, ported from upstream
-  // UsageTable.js plus the per-view column sets in UsageStats.js. All row maths
-  // lives in tableModel.ts so it stays testable outside a render harness.
   import Badge from '../../lib/ui/Badge.svelte'
   import Card from '../../lib/ui/Card.svelte'
   import ProviderArtwork from '../providers/ProviderArtwork.svelte'
   import {
-    TABLE_EMPTY_MESSAGE,
-    TABLE_STORAGE_KEY,
-    buildTable,
-    getColumns,
-    nextSort,
-    type UsageGroup,
-    type UsageRow,
-  } from './tableModel'
-  import {
     fmt,
-    fmtCost,
     timeAgo,
+    providerDisplayName,
     TABLE_OPTIONS,
-    type SortOrder,
     type StatsData,
     type TableView,
     type ViewMode,
+    type UsageItem
   } from './types'
+  import { costIn } from '../../lib/currency.svelte'
 
-  interface Props {
-    stats?: StatsData
-    tableView: TableView
-    viewMode: ViewMode
-    sortBy: string
-    sortOrder: SortOrder
-    onTableViewChange: (view: TableView) => void
-    onViewModeChange: (view: ViewMode) => void
-    onSortChange: (sortBy: string, sortOrder: SortOrder) => void
+  let { stats = {} }: { stats?: StatsData } = $props()
+
+  let tableView = $state<TableView>('model')
+  let viewMode = $state<ViewMode>('costs')
+
+  // Every column of the breakdown table is sortable: click a header for that
+  // column, click it again to reverse. The default (requests, descending) is
+  // what the table showed before the headers became clickable, so nothing about
+  // the initial view changed.
+  type SortKey =
+    | 'name'
+    | 'provider'
+    | 'requests'
+    | 'cost'
+    | 'promptTokens'
+    | 'completionTokens'
+    | 'cachedTokens'
+    | 'lastUsed'
+
+  let sortKey = $state<SortKey>('requests')
+  let sortDir = $state<'asc' | 'desc'>('desc')
+
+  function toggleSort(key: SortKey) {
+    if (sortKey === key) {
+      sortDir = sortDir === 'asc' ? 'desc' : 'asc'
+      return
+    }
+    sortKey = key
+    // Text columns read best AÔåÆZ first; every numeric/timestamp column is more
+    // useful biggest/newest first, which is also the unsorted default.
+    sortDir = key === 'name' || key === 'provider' ? 'asc' : 'desc'
   }
 
-  let {
-    stats = {},
-    tableView,
-    viewMode,
-    sortBy,
-    sortOrder,
-    onTableViewChange,
-    onViewModeChange,
-    onSortChange,
-  }: Props = $props()
+  interface ProcessedUsageRow extends UsageItem {
+    key: string
+    /** The name this row is rendered under, and what the Name column sorts on. */
+    label: string
+    totalTokens: number
+  }
 
-  const VIEW_MODES: { value: ViewMode; label: string }[] = [
-    { value: 'costs', label: 'Costs' },
-    { value: 'tokens', label: 'Tokens' },
-  ]
-
-  let expanded = $state<Set<string>>(new Set())
-
-  const storageKey = $derived(TABLE_STORAGE_KEY[tableView])
-  const groups = $derived<UsageGroup[]>(buildTable(stats, tableView, sortBy, sortOrder))
-  // One unified column list, so the header and the body can never drift apart
-  // in width the way separately hand-counted cells did.
-  const columns = $derived(getColumns(tableView, viewMode))
-
-  // Expanded groups persist per view, so switching tables and returning keeps
-  // the rows the user opened.
-  $effect(() => {
-    const key = storageKey
-    try {
-      const saved = window.localStorage.getItem(key)
-      expanded = new Set(saved ? (JSON.parse(saved) as string[]) : [])
-    } catch (error) {
-      console.error(`Failed to load ${key}:`, error)
-      expanded = new Set()
+  function rowLabel(tableView: TableView, key: string, item: UsageItem): string {
+    switch (tableView) {
+      case 'account':
+        return item.accountName || key
+      case 'apiKey':
+        return item.keyName || key
+      case 'endpoint':
+        return item.endpoint || key
+      case 'provider':
+        // byProvider is keyed by the provider id; the dashboard shows its
+        // display name, so the column and the sort agree with what is drawn.
+        return providerDisplayName(key)
+      default:
+        return item.rawModel || key
     }
+  }
+
+  let tableData = $derived((): ProcessedUsageRow[] => {
+    if (!stats) return []
+    let sourceMap: Record<string, UsageItem> = {}
+    if (tableView === 'model') sourceMap = stats.byModel || {}
+    else if (tableView === 'provider') sourceMap = stats.byProvider || {}
+    else if (tableView === 'account') sourceMap = stats.byAccount || {}
+    else if (tableView === 'apiKey') sourceMap = stats.byApiKey || {}
+    else if (tableView === 'endpoint') sourceMap = stats.byEndpoint || {}
+
+    const rows = Object.entries(sourceMap).map(([key, item]) => {
+      const totalTokens = (item.promptTokens || 0) + (item.completionTokens || 0)
+      return {
+        key,
+        ...item,
+        // The provider breakdown carries no provider field of its own (the key
+        // is the provider), so fill it in: the artwork and badge read it.
+        provider: tableView === 'provider' ? item.provider || key : item.provider,
+        label: rowLabel(tableView, key, item),
+        totalTokens,
+      }
+    })
+
+    const dir = sortDir === 'asc' ? 1 : -1
+    return rows.sort((a, b) => {
+      switch (sortKey) {
+        case 'name':
+          return dir * a.label.localeCompare(b.label)
+        case 'provider':
+          return dir * (a.provider || '').localeCompare(b.provider || '')
+        case 'cost':
+          return dir * ((a.cost || 0) - (b.cost || 0))
+        case 'promptTokens':
+          return dir * ((a.promptTokens || 0) - (b.promptTokens || 0))
+        case 'completionTokens':
+          return dir * ((a.completionTokens || 0) - (b.completionTokens || 0))
+        case 'cachedTokens':
+          return dir * ((a.cachedTokens || 0) - (b.cachedTokens || 0))
+        case 'lastUsed':
+          // Timestamps are stored as ISO strings, so a lexical compare is a
+          // chronological one. Rows without one (daily windows) sort last
+          // ascending and first descending, never in the middle.
+          return dir * (a.lastUsed || '').localeCompare(b.lastUsed || '')
+        default:
+          return dir * ((a.requests || 0) - (b.requests || 0))
+      }
+    })
   })
 
-  $effect(() => {
-    const key = storageKey
-    const snapshot = [...expanded]
-    try {
-      window.localStorage.setItem(key, JSON.stringify(snapshot))
-    } catch (error) {
-      console.error(`Failed to save ${key}:`, error)
-    }
-  })
+  const nameHeader = $derived(
+    tableView === 'model'
+      ? 'Model'
+      : tableView === 'provider'
+        ? 'Provider'
+        : tableView === 'account'
+          ? 'Account'
+          : tableView === 'apiKey'
+            ? 'Key Name'
+            : 'Endpoint'
+  )
 
-  function toggleGroup(groupKey: string): void {
-    const next = new Set(expanded)
-    if (next.has(groupKey)) next.delete(groupKey)
-    else next.add(groupKey)
-    expanded = next
+  // A header is a button: the arrow marks the active column and its direction,
+  // and an inactive column shows a dimmed pair so the affordance is visible.
+  function arrow(key: SortKey): string {
+    if (sortKey !== key) return 'Ôåò'
+    return sortDir === 'asc' ? 'Ôåæ' : 'Ôåô'
   }
 
-  function sortIndicator(field: string): string {
-    if (sortBy !== field) return '↕'
-    return sortOrder === 'asc' ? '↑' : '↓'
-  }
-
-  function handleSort(field: string): void {
-    const next = nextSort({ sortBy, sortOrder }, field)
-    onSortChange(next.sortBy, next.sortOrder)
-  }
-
-  function text(row: UsageRow | UsageGroup['summary'], field: string): string {
-    const value = (row as Record<string, unknown>)[field]
-    if (value === undefined || value === null || value === '') return ''
-    return String(value)
-  }
-
-  function count(row: UsageRow | UsageGroup['summary'], field: string): string {
-    return fmt(Number((row as Record<string, unknown>)[field] ?? 0))
-  }
-
-  function money(row: UsageRow | UsageGroup['summary'], field: string): string {
-    return fmtCost(Number((row as Record<string, unknown>)[field] ?? 0))
+  function headerClass(key: SortKey, align: 'left' | 'right' = 'left'): string {
+    const base =
+      'inline-flex w-full items-center gap-1 text-[10px] font-semibold uppercase tracking-wider cursor-pointer select-none hover:text-text-main transition-colors'
+    return `${base} ${align === 'right' ? 'justify-end' : 'justify-start'} ${
+      sortKey === key ? 'text-text-main' : 'text-text-muted'
+    }`
   }
 </script>
 
 <div class="flex flex-col gap-3 pt-2">
   <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+    <!-- View selector dropdown -->
     <select
-      value={tableView}
-      onchange={(event) => onTableViewChange((event.currentTarget as HTMLSelectElement).value as TableView)}
-      class="w-full cursor-pointer rounded-lg border border-border bg-surface px-3 py-1.5 text-sm font-semibold text-text-main focus:outline-none focus:ring-2 focus:ring-brand-500/50 sm:w-auto"
-      aria-label="Usage breakdown view"
+      bind:value={tableView}
+      class="w-full sm:w-auto rounded-lg border border-border bg-surface px-3 py-1.5 text-sm font-semibold text-text-main focus:outline-none focus:ring-2 focus:ring-brand-500/50 cursor-pointer"
     >
-      {#each TABLE_OPTIONS as option (option.value)}
-        <option value={option.value}>{option.label}</option>
+      {#each TABLE_OPTIONS as opt}
+        <option value={opt.value}>{opt.label}</option>
       {/each}
     </select>
 
-    <div
-      class="inline-flex self-start rounded-xl border border-border bg-surface p-1 shadow-sm sm:self-auto"
-      role="group"
-      aria-label="Value shown"
-    >
-      {#each VIEW_MODES as mode (mode.value)}
-        <button
-          type="button"
-          onclick={() => onViewModeChange(mode.value)}
-          aria-pressed={viewMode === mode.value}
-          class="cursor-pointer rounded-lg px-3 py-1 text-xs font-semibold transition-colors {viewMode ===
-          mode.value
-            ? 'bg-brand-500 text-white shadow-sm'
-            : 'text-text-muted hover:bg-surface-3 hover:text-text-main'}"
-        >
-          {mode.label}
-        </button>
-      {/each}
+    <!-- Toggle: Costs | Tokens -->
+    <div class="inline-flex rounded-xl bg-surface border border-border p-1 shadow-sm self-start sm:self-auto">
+      <button
+        type="button"
+        onclick={() => (viewMode = 'costs')}
+        class="rounded-lg px-3 py-1 text-xs font-semibold transition-colors cursor-pointer {viewMode === 'costs'
+          ? 'bg-brand-500 text-white shadow-sm'
+          : 'text-text-muted hover:text-text-main'}"
+      >
+        Costs
+      </button>
+      <button
+        type="button"
+        onclick={() => (viewMode = 'tokens')}
+        class="rounded-lg px-3 py-1 text-xs font-semibold transition-colors cursor-pointer {viewMode === 'tokens'
+          ? 'bg-brand-500 text-white shadow-sm'
+          : 'text-text-muted hover:text-text-main'}"
+      >
+        Tokens
+      </button>
     </div>
   </div>
 
+  <!-- Breakdown Table Card -->
   <Card padding="none" class="overflow-hidden border border-border">
-    {#if groups.length === 0}
-      <div class="p-8 text-center font-body text-sm text-text-muted">
-        {TABLE_EMPTY_MESSAGE[tableView]}
+    {#if tableData().length === 0}
+      <div class="p-8 text-center text-text-muted text-sm font-body">
+        No usage recorded for this period.
       </div>
     {:else}
       <div class="overflow-x-auto">
-        <table class="w-full border-collapse text-left text-xs font-body">
-          <thead
-            class="border-b border-border bg-surface-2 text-[10px] font-semibold uppercase tracking-wider text-text-muted"
-          >
+        <table class="w-full text-left border-collapse text-xs font-body">
+          <thead class="bg-surface-2 border-b border-border uppercase font-semibold">
             <tr>
-              {#each columns as column (column.field)}
-                <th
-                  class="cursor-pointer px-4 py-3 hover:bg-surface-3 {column.align === 'right' ? 'text-right' : ''}"
-                  onclick={() => handleSort(column.field)}
-                  aria-sort={sortBy === column.field ? (sortOrder === 'asc' ? 'ascending' : 'descending') : 'none'}
-                >
-                  {column.label}
-                  <span class="ml-1 opacity-60">{sortIndicator(column.field)}</span>
+              <th class="py-3 px-4" aria-sort={sortKey === 'name' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
+                <button type="button" class={headerClass('name')} onclick={() => toggleSort('name')}>
+                  {nameHeader}
+                  <span class="text-[9px]">{arrow('name')}</span>
+                </button>
+              </th>
+              {#if tableView !== 'provider'}
+                <th class="py-3 px-4" aria-sort={sortKey === 'provider' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
+                  <button type="button" class={headerClass('provider')} onclick={() => toggleSort('provider')}>
+                    Provider
+                    <span class="text-[9px]">{arrow('provider')}</span>
+                  </button>
                 </th>
-              {/each}
+              {/if}
+              <th class="py-3 px-4" aria-sort={sortKey === 'requests' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
+                <button type="button" class={headerClass('requests', 'right')} onclick={() => toggleSort('requests')}>
+                  Requests
+                  <span class="text-[9px]">{arrow('requests')}</span>
+                </button>
+              </th>
+              {#if viewMode === 'costs'}
+                <th class="py-3 px-4" aria-sort={sortKey === 'cost' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
+                  <button type="button" class={headerClass('cost', 'right')} onclick={() => toggleSort('cost')}>
+                    Total Cost
+                    <span class="text-[9px]">{arrow('cost')}</span>
+                  </button>
+                </th>
+              {:else}
+                <th class="py-3 px-4" aria-sort={sortKey === 'promptTokens' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
+                  <button type="button" class={headerClass('promptTokens', 'right')} onclick={() => toggleSort('promptTokens')}>
+                    In Tokens
+                    <span class="text-[9px]">{arrow('promptTokens')}</span>
+                  </button>
+                </th>
+                <th class="py-3 px-4" aria-sort={sortKey === 'completionTokens' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
+                  <button type="button" class={headerClass('completionTokens', 'right')} onclick={() => toggleSort('completionTokens')}>
+                    Out Tokens
+                    <span class="text-[9px]">{arrow('completionTokens')}</span>
+                  </button>
+                </th>
+                <th class="py-3 px-4" aria-sort={sortKey === 'cachedTokens' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
+                  <button type="button" class={headerClass('cachedTokens', 'right')} onclick={() => toggleSort('cachedTokens')}>
+                    Cached Tokens
+                    <span class="text-[9px]">{arrow('cachedTokens')}</span>
+                  </button>
+                </th>
+              {/if}
+              <th class="py-3 px-4" aria-sort={sortKey === 'lastUsed' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
+                <button type="button" class={headerClass('lastUsed', 'right')} onclick={() => toggleSort('lastUsed')}>
+                  Last Used
+                  <span class="text-[9px]">{arrow('lastUsed')}</span>
+                </button>
+              </th>
             </tr>
           </thead>
           <tbody class="divide-y divide-border/60">
@@ -185,83 +260,45 @@
                         class="w-4 h-4 object-contain rounded shrink-0 bg-surface-2 p-0.5 border border-border/40 text-[9px] leading-none font-semibold"
                       />
                     {/if}
-                    <span class="truncate">{row.rawModel || row.accountName || row.keyName || row.endpoint || row.key}</span>
+                    <span class="truncate">{row.label}</span>
                   </div>
                 </td>
-                <td class="py-3 px-4">
-                  <div class="flex items-center gap-1.5">
-                    {#if row.provider}
-                      <ProviderArtwork
-                        id={row.provider}
-                        alt={row.provider}
-                        class="w-3.5 h-3.5 object-contain rounded shrink-0 text-[9px] leading-none font-semibold"
-                      />
-                    {/if}
-                    <Badge variant="neutral" size="sm">{row.provider || 'unknown'}</Badge>
-                  </div>
-                </td>
+                {#if tableView !== 'provider'}
+                  <td class="py-3 px-4">
+                    <div class="flex items-center gap-1.5">
+                      {#if row.provider}
+                        <ProviderArtwork
+                          id={row.provider}
+                          alt={row.provider}
+                          class="w-3.5 h-3.5 object-contain rounded shrink-0 text-[9px] leading-none font-semibold"
+                        />
+                      {/if}
+                      <Badge variant="neutral" size="sm">{row.provider || 'unknown'}</Badge>
+                    </div>
+                  </td>
+                {/if}
                 <td class="py-3 px-4 text-right font-mono font-semibold text-text-main">
                   {fmt(row.requests)}
                 </td>
                 {#if viewMode === 'costs'}
                   <td class="py-3 px-4 text-right font-mono font-bold text-warning">
-                    {fmtCost(row.cost)}
+                    {costIn(row.cost ?? 0)}
                   </td>
-                {/each}
+                {:else}
+                  <td class="py-3 px-4 text-right font-mono text-brand-500">
+                    {fmt(row.promptTokens)}
+                  </td>
+                  <td class="py-3 px-4 text-right font-mono text-success">
+                    {fmt(row.completionTokens)}
+                  </td>
+                  <td class="py-3 px-4 text-right font-mono text-info">
+                    {fmt(row.cachedTokens)}
+                  </td>
+                {/if}
+                <td class="py-3 px-4 text-right text-text-muted whitespace-nowrap text-[11px]">
+                  {timeAgo(row.lastUsed)}
+                </td>
               </tr>
-
-              {#if expanded.has(group.groupKey)}
-                {#each group.items as item (item.key)}
-                  <tr class="transition-colors hover:bg-surface-2/40">
-                    {#each columns as column, index (column.field)}
-                      <td
-                        class="px-4 py-2.5 {column.align === 'right' ? 'text-right' : ''}"
-                        class:pl-10={index === 0}
-                      >
-                        {#if column.kind === 'badge'}
-                          <div class="flex items-center gap-1.5">
-                            {#if item.provider}
-                              <img
-                                src={getIconPath(item.provider)}
-                                alt={item.provider}
-                                class="size-3.5 shrink-0 rounded-sm border border-border/40 bg-surface-2 object-contain"
-                                loading="lazy"
-                                onerror={(event) => {
-                                  ;(event.currentTarget as HTMLElement).style.display = 'none'
-                                }}
-                              />
-                            {/if}
-                            <Badge variant={item.pending > 0 ? 'primary' : 'neutral'} size="sm">
-                              {item.provider || 'unknown'}
-                            </Badge>
-                          </div>
-                        {:else if column.kind === 'text'}
-                          <span
-                            class="block truncate {item.pending > 0
-                              ? 'font-semibold text-primary'
-                              : 'text-text-main'}"
-                            title={text(item, column.field)}
-                          >
-                            {text(item, column.field) || '—'}
-                          </span>
-                        {:else if column.kind === 'count'}
-                          <span class="font-mono font-semibold text-text-main">
-                            {count(item, column.field)}
-                          </span>
-                        {:else if column.kind === 'time'}
-                          <span class="whitespace-nowrap text-text-muted">{timeAgo(item.lastUsed)}</span>
-                        {:else if column.kind === 'money'}
-                          <span class="font-mono font-bold text-warning">
-                            {money(item, column.field)}
-                          </span>
-                        {:else}
-                          <span class="font-mono text-text-main">{count(item, column.field)}</span>
-                        {/if}
-                      </td>
-                    {/each}
-                  </tr>
-                {/each}
-              {/if}
             {/each}
           </tbody>
         </table>
