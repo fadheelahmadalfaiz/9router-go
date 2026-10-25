@@ -99,12 +99,15 @@ describe('router', () => {
 })
 
 describe('usage sections', () => {
-  it('offers the four sections the issue asked to merge under Usage', () => {
+  it('offers the sections the issue asked to merge under Usage, plus Logs', () => {
     expect(USAGE_SECTIONS.map((s) => s.value)).toEqual([
       'overview',
       'cache',
       'compression',
       'details',
+      // Logs is this fork's addition: RequestLogsView is a full request log the
+      // upstream four-section layout has no home for.
+      'logs',
     ])
   })
 
