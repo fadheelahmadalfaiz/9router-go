@@ -177,13 +177,14 @@ const ROUTE_TO_TAB: Record<string, ActiveTab> = {
 // traffic as the Overview, and as top-level sidebar entries they read as
 // separate products. Each section that owns a path gets its own tab, so the
 // section is linkable and survives a reload.
-export type UsageSection = 'overview' | 'cache' | 'compression' | 'details'
+export type UsageSection = 'overview' | 'cache' | 'compression' | 'details' | 'logs'
 
 export const USAGE_SECTIONS: { value: UsageSection; label: string; icon: string }[] = [
   { value: 'overview', label: 'Overview', icon: 'bar_chart' },
   { value: 'cache', label: 'Cache Analytics', icon: 'cached' },
   { value: 'compression', label: 'Compression Analytics', icon: 'compress' },
   { value: 'details', label: 'Details', icon: 'receipt_long' },
+  { value: 'logs', label: 'Logs', icon: 'list_alt' },
 ]
 
 // USAGE_SECTION_BY_VALUE is partial on purpose: Overview and Details share the

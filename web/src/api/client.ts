@@ -1620,10 +1620,11 @@ export const api = {
    * answers on /v1/systemone, and a chat probe on it returns 500. Omit `kind`
    * for a plain LLM model.
    */
-  testModel: (model: string, kind?: string) =>
+  testModel: (model: string, kind?: string, signal?: AbortSignal) =>
     request<{ ok: boolean; error?: string; note?: string; latencyMs?: number; status?: number; blocked?: boolean; resetAt?: string }>('/api/models/test', {
       method: 'POST',
       body: JSON.stringify({ model, kind }),
+      signal,
     }),
 
   // Settings
@@ -1921,6 +1922,12 @@ export const api = {
       `/api/usage/chart?period=${encodeURIComponent(period)}`
     ),
   getUsageRequestLogs: (limit = 200) => request<string[]>(`/api/usage/request-logs?limit=${limit}`),
+  /** Probes a slice of connections; every call is a real completion. */
+  testBatch: (payload: { mode: BatchTestMode; providerId?: string; providerIds?: string[] }) =>
+    request<BatchTestResponse>('/api/providers/test-batch', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
   /** Details-section dashboard payload: heatmap days, lifetime cards, node health. */
   getUsageDashboard: () => request<UsageDashboardResponse>('/api/usage/dashboard'),
   /** Paged request rows; period windows the server query (?period=<preset|n>d|n>h). */

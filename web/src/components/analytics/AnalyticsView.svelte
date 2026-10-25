@@ -13,6 +13,7 @@
     type Period,
     type StatsData,
     type RequestDetailItem,
+    type RecentRequestItem,
     type SortOrder,
     type TableView,
     type ViewMode,
@@ -352,6 +353,12 @@
     }
   })
 
+  // A custom provider node is named by the operator, and that name is what the
+  // topology should show instead of the raw provider id.
+  const nodeNameById = $derived(
+    new Map(providerNodes.filter((node) => node.id && node.name).map((node) => [node.id, node.name as string])),
+  )
+
   function topologyName(providerId: string, fallbackName?: string): string {
     // The fallback is a connection name, and for OAuth connections that is
     // the account email â€” mask it the same way the connection lists do.
@@ -454,25 +461,6 @@
 
     return list
   })
-
-  function restoreUrlState(): void {
-    const restored = parseUsageUrlState(window.location.search)
-    activeTab = restored.tab
-    period = restored.period
-    tableView = restored.table
-    viewMode = restored.view
-    sortBy = restored.sortBy
-    sortOrder = restored.sortOrder
-  }
-
-  function handleTabChange(tab: MainTab): void {
-    activeTab = tab
-  }
-
-  function handleSortChange(nextSortBy: string, nextSortOrder: SortOrder): void {
-    sortBy = nextSortBy
-    sortOrder = nextSortOrder
-  }
 </script>
 
 <!-- The section picker, defined once here and handed to the sections that put
@@ -667,7 +655,7 @@
         {@render sectionMenu?.()}
       {/snippet}
     </CompressionAnalyticsView>
-  {:else}
+  {:else if section === 'details'}
     <RequestDetailsTab
       {details}
       {detailsTotal}
@@ -679,7 +667,7 @@
       {providerNodes}
       {connections}
     />
-  {:else}
+  {:else if section === 'logs'}
     <RequestLogsView />
   {/if}
 </div>

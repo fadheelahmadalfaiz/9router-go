@@ -2116,7 +2116,7 @@
     setTimeout(() => (copiedModelId = null), 2000)
   }
 
-  async function testModel(modelId: string, silent = false) {
+  async function testModel(modelId: string, signal?: AbortSignal, silent = false) {
     // Probes take seconds; if the panel switches provider mid-flight the
     // verdict belongs to the old provider and must not be written here.
     const pid = providerId
@@ -2124,7 +2124,10 @@
     modelTestErrors[modelId] = null
     if (!silent) activeModelTestError = null
     try {
-      const res = await api.testModel(`${storageAlias}/${modelId}`)
+      const res = await api.testModel(`${storageAlias}/${modelId}`, undefined, signal)
+      // An aborted probe has no verdict; writing one would pin a red "error" on
+      // a model that was never actually tested.
+      if (signal?.aborted) return
       if (pid !== providerId) return
       const verdict = parseModelTestVerdict(res)
       modelTestStatuses[modelId] = verdict.status
@@ -2133,6 +2136,7 @@
         activeModelTestError = `${modelId}: ${verdict.error}`
       }
     } catch (err) {
+      if (signal?.aborted) return
       if (pid !== providerId) return
       modelTestStatuses[modelId] = 'error'
       const msg = err instanceof Error ? err.message : 'Model test failed'
@@ -2448,7 +2452,7 @@
     compatibleTesting[modelId] = true
     compatibleTestErrors[modelId] = null
     try {
-      const res = await api.testModel(`${storageAlias}/${modelId}`, signal)
+      const res = await api.testModel(`${storageAlias}/${modelId}`, undefined, signal)
       // A probe we aborted says nothing about the model, so leave its state
       // untouched rather than pinning a red "error" that never happened.
       if (signal?.aborted) return
@@ -2851,7 +2855,7 @@
       const workers = Array.from({ length: Math.min(TEST_CONCURRENCY, ids.length) }, async () => {
         while (cursor < ids.length && pid === providerId) {
           const i = cursor++
-          await testModel(ids[i], true)
+          await testModel(ids[i], undefined, true)
           if (pid !== providerId) return
           checkAllProgress = { ...checkAllProgress, done: checkAllProgress.done + 1 }
         }

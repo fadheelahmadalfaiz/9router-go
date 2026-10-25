@@ -29,6 +29,14 @@
   import { getIconPath } from './connections/types'
   import EditConnectionModal, { type ConnectionUpdate } from './connections/EditConnectionModal.svelte'
   import QuotaTable from './quota/QuotaTable.svelte'
+  import {
+    QUOTA_URL_DEFAULTS,
+    buildQuotaUrl,
+    getQuotaFilterSignature,
+    parseQuotaUrlState,
+    type QuotaUrlState,
+  } from './quota/urlState'
+  import { pathToTab } from '../lib/router'
   import AutoPingScheduleModal, {
     type AutoPingSaveResult,
     type AutoPingSchedule,
@@ -878,11 +886,7 @@
     lastFilterSignature = getQuotaFilterSignature(restored)
   }
 
-  onMount(() => {
-    // Seed from props to avoid a flash of empty state
-    if (initialConns.length > 0 && connections.length === 0) {
-      connections = initialConns
-    }
+  let unregisterPopstate: (() => void) | null = null
 
   // A filter is not navigation, so the URL is rewritten rather than pushed:
   // the back button must not walk through every provider the operator clicked
@@ -910,12 +914,24 @@
     providerFilter = 'all'
   })
 
+  onMount(() => {
+    // Seed from props to avoid a flash of empty state
+    if (initialConns.length > 0 && connections.length === 0) {
+      connections = initialConns
+    }
+
     // A ?provider= deep link must survive a reload and be shareable, so the
     // filter starts from the URL rather than always 'all'. An unknown value is
     // kept until the option list arrives, then dropped — ignoring it up front
     // would silently un-filter the page for anyone holding an old bookmark.
     const deepLinkProvider = new URLSearchParams(window.location.search).get('provider')
     if (deepLinkProvider) providerFilter = deepLinkProvider
+
+    // Back/forward restores the filters the URL describes, the same way a reload
+    // does. Without this the URL changed but the view did not follow it.
+    window.addEventListener('popstate', restoreUrlState)
+    unregisterPopstate = () => window.removeEventListener('popstate', restoreUrlState)
+
 
     // Hydrate auto-refresh preference
     const stored = window.localStorage.getItem(AUTO_REFRESH_STORAGE_KEY)
@@ -986,6 +1002,7 @@
 
     return () => {
       stopTimers()
+      unregisterPopstate?.()
       document.removeEventListener('visibilitychange', handleVisibilityChange)
       document.removeEventListener('click', handleDocClick)
       window.removeEventListener('resize', repositionProviderPanel)
