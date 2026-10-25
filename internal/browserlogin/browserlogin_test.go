@@ -57,7 +57,10 @@ func TestFindBrowserFindsNothingWhenThereIsNone(t *testing.T) {
 func TestBrowserNamesCoverTheBrowsersTheFlowCanDrive(t *testing.T) {
 	names := browserNames()
 	for _, want := range []string{"google-chrome", "chromium", "brave-browser", "microsoft-edge"} {
-		if runtime.GOOS == "windows" && want == "google-chrome" {
+		// Windows launches the executables by their Windows names ("chrome",
+		// "msedge", "brave"), so the POSIX binary names are not expected there.
+		// chromium happens to be spelled the same on both platforms.
+		if runtime.GOOS == "windows" && want != "chromium" {
 			continue
 		}
 		found := false
