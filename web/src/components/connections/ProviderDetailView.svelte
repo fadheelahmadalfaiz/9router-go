@@ -29,7 +29,13 @@
   } from '../../lib/oauth-handoff'
   import { getModelsByProviderId, PROVIDER_ID_TO_ALIAS } from '../../lib/models'
   import { copyToClipboard } from '../../lib/clipboard'
-  import { notifyCustomModelsChanged } from '../../lib/customModels'
+  import { parseModelIds } from '../../lib/bulk-models'
+  import {
+    importCustomModelsBestEffort,
+    notifyCustomModelsChanged,
+    type CustomModelImportOutcome,
+    type CustomModelWrite,
+  } from '../../lib/customModels'
   import { emailPrivacy, formatEmailLabel } from '../../lib/privacy'
   import { loadDeprecations, refreshDeprecations, subscribeDeprecations } from '../../lib/modelDeprecations.svelte'
   import DeprecatedBadge from '../../lib/ui/DeprecatedBadge.svelte'
@@ -65,6 +71,9 @@
   import EditConnectionModal, { type ConnectionUpdate } from './EditConnectionModal.svelte'
   import AddConnectionModal from './AddConnectionModal.svelte'
   import AddCustomModelModal from './AddCustomModelModal.svelte'
+  import { nodeLimitsDraftOf, nodeLimitsSummary, nodeLimitsUsageSummary } from '../../lib/node-limits'
+  import type { ProviderNodeLimitsPatch } from '../../api/client'
+  import Badge from '../../lib/ui/Badge.svelte'
   import ProviderHeaderOverridesModal from './ProviderHeaderOverridesModal.svelte'
   import EditCompatibleNodeModal from './EditCompatibleNodeModal.svelte'
   import FreebuffSessionBanner from './FreebuffSessionBanner.svelte'
@@ -140,7 +149,8 @@
     providerId === 'qoder' || providerId === 'kilocode' || providerId === 'grok-cli' ||
     providerId === 'github' || providerId === 'kiro' || providerId === 'kimi' ||
     providerId === 'kimi-coding' || providerId === 'codebuddy-cn' || providerId === 'codebuddy-intl' ||
-    providerId === 'minimax-code' || providerId === 'minimax-code-global' || providerId === 'muse'
+    providerId === 'minimax-code' || providerId === 'minimax-code-global' || providerId === 'muse' ||
+    providerId === 'nous' || providerId === 'glm'
   )
   // Upstream parity: only the explicit noAuth flag hides the Connections card
   // ([id]/page.js isFreeNoAuth = !!FREE_PROVIDERS[id]?.noAuth). Category "free"
@@ -251,9 +261,12 @@
   let isAddingCompatibleModel = $state(false)
   let isImportingCompatibleModels = $state(false)
   let isImportingLiveCatalogModels = $state(false)
-  let compatibleTestId = $state<string | null>(null)
-  let compatibleTestResults = $state<Record<string, 'ok' | 'error'>>({})
+  let compatibleTesting = $state<Record<string, boolean>>({})
+  let compatibleTestResults = $state<Record<string, ModelTestStatus>>({})
   let compatibleTestErrors = $state<Record<string, string | null>>({})
+  let compatibleTestLatency = $state<Record<string, number>>({})
+  let compatibleTestAllRunning = $state(false)
+  let isRemovingCompatibleModels = $state(false)
   let compatibleRows = $derived.by(() => {
     const rows: Array<{ id: string; source: 'custom' | 'legacyAlias'; alias?: string }> = []
     const seen = new Set<string>()
@@ -552,6 +565,12 @@
   let isFreebuff = $derived(
     providerId === 'freebuff' || storageAlias === 'fb' || storageAlias === 'freebuff'
   )
+  // DeepSeek's credential is renewed by a browser, not by the client: the
+  // site's userToken is only issued by a real sign-in, and the WAF's cookie
+  // is only renewed by the browser that solves its challenge. So the renewal
+  // opens a browser and waits for a human.
+  let isDeepSeekWeb = $derived(providerId === 'deepseek-web')
+  let renewingConnId = $state<string | null>(null)
   // The session API has to be asked about an account that can actually serve.
   // Connections are ordered by priority, and a disabled one can sort first —
   // its rejected credential reports `banned`/`unauthorized` and blanks the
@@ -1096,6 +1115,27 @@
       oneByOneStatuses = { ...oneByOneStatuses, [conn.id]: probeOutcomeFromError(err) }
     } finally {
       onRefresh()
+    }
+  }
+
+  /**
+   * Renew one DeepSeek Web connection's credential.
+   *
+   * A browser opens and waits for the sign-in, so the operator has to be
+   * there for it. The credential that comes back is written to the row, so
+   * there is nothing to paste.
+   */
+  async function renewDeepSeekCredential(conn: ProviderConnection) {
+    if (renewingConnId) return
+    renewingConnId = conn.id
+    try {
+      await api.renewDeepSeekCredential(conn.id)
+      alert('The credential was renewed.')
+      onRefresh()
+    } catch (err) {
+      alert(`The renewal failed: ${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      renewingConnId = null
     }
   }
 
@@ -2150,32 +2190,6 @@
   // Same sweep for a compatible node's own model list, which is the section a
   // custom provider actually renders — the "Available Models" block above is
   // hidden for these nodes, so its button is unreachable here.
-  async function handleTestAllCompatibleModels() {
-    if (isTestingAllCompatibleModels) return
-    const targets = compatibleRows.map((row) => row.id)
-    if (targets.length === 0) return
-
-    const controller = new AbortController()
-    compatibleSweepController = controller
-    isTestingAllCompatibleModels = true
-    allCompatibleTestSummary = null
-    activeModelTestError = null
-
-    try {
-      allCompatibleTestSummary = await runSweep(
-        targets,
-        async (modelId, signal) => {
-          await handleTestCompatibleModel(modelId, signal)
-          return compatibleTestResults[modelId] === 'ok'
-        },
-        controller.signal,
-      )
-    } finally {
-      isTestingAllCompatibleModels = false
-      compatibleSweepController = null
-    }
-  }
-
   async function handleDisableModel(modelId: string) {
     const updated = Array.from(new Set([...disabledModelIds, modelId]))
     disabledModelIds = updated
@@ -2240,6 +2254,21 @@
     }
   }
 
+  /**
+   * A bulk paste writes rows the panel's own list has to show, so the reload is
+   * the same one a single add does — the modal cannot do it, because the model
+   * list belongs to this view.
+   */
+  async function handleBulkModelsSaved() {
+    try {
+      const modelsData = await fetchProviderModelsData(providerId, storageAlias)
+      customModels = modelsData.customModels
+      notifyCustomModelsChanged()
+    } catch (err) {
+      alert(`Models were saved but the list could not be reloaded: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
   async function handleAddKeyConnection(payload: CreateConnectionPayload) {
     addConnectionError = ''
     try {
@@ -2283,19 +2312,34 @@
     apiType?: string
     baseUrl: string
     urlSuffix: string
+    limits: ProviderNodeLimitsPatch
   }) {
     if (!selectedNode) return
+    const previousId = selectedNode.id
     try {
-      const res = await api.updateProviderNode(selectedNode.id, {
+      const res = await api.updateProviderNode(previousId, {
         name: data.name,
         prefix: data.prefix,
         ...(selectedNode.type === 'openai-compatible' && data.apiType ? { apiType: data.apiType } : {}),
         baseUrl: data.baseUrl,
         urlSuffix: data.urlSuffix || undefined
       })
+      // The id the server answered with, which differs from the one we sent when the
+      // URL suffix changed. The policy is written against that id: the limits columns
+      // live on the node's own row, so an edited suffix moves them, and a write aimed
+      // at the old id would leave the node looking unlimited.
+      const savedId = res?.node?.id || previousId
+      try {
+        const saved = await api.setProviderNodeLimits(savedId, data.limits)
+        selectedNode = { ...selectedNode, id: savedId, limits: saved.limits }
+      } catch (err) {
+        alert(
+          `Provider node saved, but its capacity limits did not: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
       showEditNodeModal = false
-      if (res?.node?.id && res.node.id !== selectedNode.id) {
-        onSelectProvider?.(res.node.id)
+      if (savedId !== previousId) {
+        onSelectProvider?.(savedId)
       }
       onRefresh()
     } catch (err) {
@@ -2321,9 +2365,46 @@
     }
   }
 
+  // The Model ID field above is where an operator actually pastes a provider's model
+  // list, so it takes one id or a whole list. Splitting happens on the same separators
+  // the Add Model dialog uses (spaces, commas, semicolons, newlines), because "paste
+  // three ids and get one model whose id contains the spaces" is what this field did
+  // before — a row nothing can address without reproducing them exactly.
+  let newCompatibleModelsPlan = $derived(parseModelIds(newCompatibleModel, storageAlias))
+
   async function handleAddCompatibleModel() {
-    const modelId = newCompatibleModel.trim()
-    if (!modelId || isAddingCompatibleModel) return
+    const plan = parseModelIds(newCompatibleModel.trim(), storageAlias)
+    if (plan.ids.length === 0 || isAddingCompatibleModel) return
+    if (plan.ids.length === 1) {
+      await addOneCompatibleModel(plan.ids[0])
+      return
+    }
+    isAddingCompatibleModel = true
+    try {
+      // One request for the list, so a refused line cannot stop the ones after it, and
+      // the response says which lines landed instead of leaving it to the refresh.
+      const out = await api.saveCustomModelsBulk({
+        providerAlias: storageAlias,
+        models: plan.ids.map((id) => ({ id, type: 'llm' })),
+      })
+      newCompatibleModel = ''
+      await refreshCompatibleModels()
+      notifyCustomModelsChanged()
+      if (out.skipped.length > 0) {
+        alert(
+          `Added ${out.added.length} of ${plan.ids.length}.\n\nNot added:\n` +
+            out.skipped.map((skip) => `${skip.id} — ${skip.reason}`).join('\n'),
+        )
+      }
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Failed to add models')
+      console.error('Error adding models:', err)
+    } finally {
+      isAddingCompatibleModel = false
+    }
+  }
+
+  async function addOneCompatibleModel(modelId: string) {
     if (compatibleRows.some((r) => r.id === modelId)) {
       alert('Model already exists for this provider.')
       return
@@ -2339,8 +2420,8 @@
       await refreshCompatibleModels()
       notifyCustomModelsChanged()
     } catch (err) {
-      // A refusal (the id already addresses a combo or a model alias) has to
-      // reach the user, like the other import paths on this page.
+      // A refusal (the id cannot be an address, or it already means something else) has
+      // to reach the user, like the other import paths on this page.
       alert(err instanceof Error ? err.message : 'Failed to add model')
       console.error('Error adding model:', err)
     } finally {
@@ -2363,33 +2444,125 @@
   }
 
   async function handleTestCompatibleModel(modelId: string, signal?: AbortSignal) {
-    if (compatibleTestId) return
-    compatibleTestId = modelId
+    if (compatibleTesting[modelId]) return
+    compatibleTesting[modelId] = true
     compatibleTestErrors[modelId] = null
     try {
       const res = await api.testModel(`${storageAlias}/${modelId}`, signal)
       // A probe we aborted says nothing about the model, so leave its state
       // untouched rather than pinning a red "error" that never happened.
       if (signal?.aborted) return
-      if (res.ok) {
-        compatibleTestResults[modelId] = 'ok'
-        compatibleTestErrors[modelId] = null
-      } else {
-        compatibleTestResults[modelId] = 'error'
-        const err = res.error || 'Model test failed'
-        compatibleTestErrors[modelId] = err
-        activeModelTestError = `${modelId}: ${err}`
-      }
+      compatibleTestLatency[modelId] = res.latencyMs ?? 0
+      const verdict = parseModelTestVerdict(res)
+      compatibleTestResults[modelId] = verdict.status
+      compatibleTestErrors[modelId] = verdict.error
     } catch (err) {
       if (signal?.aborted) return
       compatibleTestResults[modelId] = 'error'
-      const msg = err instanceof Error ? err.message : 'Model test failed'
-      compatibleTestErrors[modelId] = msg
-      activeModelTestError = `${modelId}: ${msg}`
+      compatibleTestErrors[modelId] = err instanceof Error ? err.message : 'Model test failed'
     } finally {
-      compatibleTestId = null
+      compatibleTesting[modelId] = false
     }
   }
+
+  // Bulk removal for a node whose list came from an import. The single-row
+  // delete beside each model is the same operation repeated, so this only adds
+  // the one-request path; the rows it removes are exactly the ones the import
+  // wrote (custom models + the aliases pointing at them), never the catalog.
+  async function handleRemoveAllCompatibleModels() {
+    if (isRemovingCompatibleModels || compatibleTestAllRunning) return
+    const total = compatibleRows.length
+    if (total === 0) return
+    if (
+      !confirm(
+        `Remove all ${total} model(s) from ${displayAlias()}? Imported models and any aliases pointing at them are deleted. Models that ship with the build stay. This cannot be undone.`
+      )
+    )
+      return
+    isRemovingCompatibleModels = true
+    try {
+      const res = await api.deleteProviderModels(storageAlias)
+      compatibleTestResults = {}
+      compatibleTestErrors = {}
+      compatibleTestLatency = {}
+      await refreshCompatibleModels()
+      notifyCustomModelsChanged()
+      if (!res || res.count === 0) {
+        alert('Nothing was removed: this node has no imported models of its own.')
+      }
+    } catch (err) {
+      alert(`Remove failed: ${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      isRemovingCompatibleModels = false
+    }
+  }
+
+  // Each probe is a real completion that consumes account quota, so Test all
+  // runs at most 2 at once; a lower ceiling than the registry sweep's 6.
+  const COMPATIBLE_TEST_CONCURRENCY = 2
+
+  // Bounded pool: see COMPATIBLE_TEST_CONCURRENCY above. Guarded the way
+  // runModelSweep is: a run that outlives its panel stops writing, because
+  // storageAlias may already belong to the next provider by then.
+  async function handleTestAllCompatibleModels() {
+    if (compatibleTestAllRunning) return
+    const pid = providerId
+    const ids = compatibleRows.map((r) => r.id)
+    if (ids.length === 0) return
+
+    const controller = new AbortController()
+    compatibleSweepController = controller
+    isTestingAllCompatibleModels = true
+    compatibleTestAllRunning = true
+    allCompatibleTestSummary = null
+    activeModelTestError = null
+    compatibleTestResults = {}
+    compatibleTestErrors = {}
+    compatibleTestLatency = {}
+    try {
+      let cursor = 0
+      const workers = Array.from({ length: Math.min(COMPATIBLE_TEST_CONCURRENCY, ids.length) }, async () => {
+        while (cursor < ids.length && pid === providerId && !controller.signal.aborted) {
+          await handleTestCompatibleModel(ids[cursor++], controller.signal)
+        }
+      })
+      await Promise.allSettled(workers)
+    } finally {
+      if (pid === providerId) {
+        compatibleTestAllRunning = false
+        isTestingAllCompatibleModels = false
+      }
+      compatibleSweepController = null
+    }
+    allCompatibleTestSummary = summariseSweep(ids, compatibleTestResults, controller.signal.aborted)
+  }
+
+  // summariseSweep reports a finished (or cancelled) Test all run. Models the
+  // run never reached are counted as untested, never as failures: a cancelled
+  // sweep must not accuse a model nobody probed.
+  function summariseSweep(
+    ids: string[],
+    results: Record<string, string>,
+    cancelled: boolean,
+  ): SweepOutcome {
+    let passed = 0
+    let tested = 0
+    for (const id of ids) {
+      const status = results[id]
+      if (!status) continue
+      tested++
+      if (status === 'ok') passed++
+    }
+    return {
+      total: ids.length,
+      tested,
+      passed,
+      failed: tested - passed,
+      cancelled,
+    }
+  }
+
+  let compatibleTestSummary = $derived(formatCheckAllSummary(compatibleTestResults))
 
   function copyCompatibleModel(modelId: string) {
     copyToClipboard(`${displayAlias()}/${modelId}`)
@@ -2397,7 +2570,24 @@
     setTimeout(() => (copiedModelId = null), 2000)
   }
 
-  async function handleImportCompatibleModels() {
+  // Mirrors providers.IsFreeTierModel (internal/providers/registry_models.go).
+  function isFreeTierModelId(id: string): boolean {
+    return id.endsWith(':free') || id.endsWith('/free') || id.endsWith('-free')
+  }
+
+  // The server names the occupant in the refusal body, so the summary can say
+  // what has to be renamed instead of only that the id was skipped.
+  function reportImportRefusals(outcome: CustomModelImportOutcome) {
+    if (outcome.refused.length === 0) return
+    const noun = outcome.refused.length === 1 ? 'model' : 'models'
+    alert(
+      `Imported ${outcome.imported} model${outcome.imported === 1 ? '' : 's'}. ` +
+        `${outcome.refused.length} ${noun} could not be registered:\n\n` +
+        outcome.refused.map((r) => `${r.id} — ${r.reason}`).join('\n'),
+    )
+  }
+
+  async function handleImportCompatibleModels(freeOnly = false) {
     if (isImportingCompatibleModels) return
     const active = providerConnections.find((c) => c.isActive !== 0)
     if (!active) return
@@ -2409,19 +2599,22 @@
         alert('No models returned from /models.')
         return
       }
-      let imported = 0
+      const pending: CustomModelWrite[] = []
       for (const m of models) {
         const modelId = typeof m === 'string' ? m : (m.id || m.name || m.model || '')
         if (!modelId || compatibleRows.some((r) => r.id === modelId)) continue
-        await api.saveCustomModel(`${storageAlias}|${modelId}|llm`, {
+        if (freeOnly && !isFreeTierModelId(modelId)) continue
+        pending.push({
           id: modelId,
-          providerAlias: storageAlias,
-          type: 'llm',
+          key: `${storageAlias}|${modelId}|llm`,
+          value: { id: modelId, providerAlias: storageAlias, type: 'llm' },
         })
-        imported += 1
       }
+      const outcome = await importCustomModelsBestEffort(pending, api.saveCustomModel)
       await refreshCompatibleModels()
-      if (imported > 0) notifyCustomModelsChanged()
+      if (outcome.imported > 0) notifyCustomModelsChanged()
+      else if (outcome.refused.length === 0 && freeOnly) alert('No free models found in /models.')
+      reportImportRefusals(outcome)
     } catch (err) {
       alert(err instanceof Error ? err.message : 'Failed to import models')
     } finally {
@@ -2462,7 +2655,7 @@
         alert('No models returned from /models.')
         return
       }
-      let imported = 0
+      const pending: CustomModelWrite[] = []
       for (const m of models) {
         const modelId = typeof m === 'string' ? m : (m.id || m.name || m.model || '')
         if (!modelId) continue
@@ -2488,19 +2681,24 @@
           typeof m === 'object' && m !== null && 'max_completion_tokens' in m
             ? Number(m.max_completion_tokens) || 0
             : 0
-        await api.saveCustomModel(`${storageAlias}|${modelId}|llm`, {
+        pending.push({
           id: modelId,
-          providerAlias: storageAlias,
-          type: 'llm',
-          ...(caps ? { caps } : {}),
-          ...(declaredCtxLen > 0 ? { contextWindow: declaredCtxLen } : {}),
-          ...(declaredMaxOut > 0 ? { maxOutput: declaredMaxOut } : {}),
+          key: `${storageAlias}|${modelId}|llm`,
+          value: {
+            id: modelId,
+            providerAlias: storageAlias,
+            type: 'llm',
+            ...(caps ? { caps } : {}),
+            ...(declaredCtxLen > 0 ? { contextWindow: declaredCtxLen } : {}),
+            ...(declaredMaxOut > 0 ? { maxOutput: declaredMaxOut } : {}),
+          },
         })
-        imported++
       }
+      const outcome = await importCustomModelsBestEffort(pending, api.saveCustomModel)
       const modelsData = await fetchProviderModelsData(providerId, storageAlias)
       customModels = modelsData.customModels
-      if (imported > 0) notifyCustomModelsChanged()
+      if (outcome.imported > 0) notifyCustomModelsChanged()
+      reportImportRefusals(outcome)
     } catch (err) {
       alert(err instanceof Error ? err.message : 'Failed to import models')
     } finally {
@@ -2532,6 +2730,14 @@
     modelTestErrors = {}
     checkAllSummary = null
     activeModelTestError = null
+    // The compatible-model probes share this panel's lifetime too: without
+    // these, a provider switch shows the previous provider's verdicts and
+    // latencies against the new provider's model list.
+    compatibleTesting = {}
+    compatibleTestResults = {}
+    compatibleTestErrors = {}
+    compatibleTestLatency = {}
+    compatibleTestAllRunning = false
   })
 
   // Providers whose /models the backend can enumerate
@@ -2545,6 +2751,22 @@
     'agnes',
     'bai',
     'muse',
+    // Command Code's Provider API publishes its whole catalogue — free tiers
+    // included — on the standard OpenAI /v1/models shape. Its registry
+    // catalog is a 22-model snapshot, so this is the only path that surfaces
+    // models added after it (reflection/beam:free, minimax/minimax-m3.1-flash).
+    'commandcode',
+    // Five more keyless catalogues, each probed live at 200 with no
+    // Authorization header. vercel-ai-gateway and chutes ship no static
+    // catalog at all, so this is the only surface that can list a model for
+    // either; nvidia and ollama carry 11 and 8 static rows against 84 and 23
+    // live ones; openrouter already had a free-tier fetcher but no backend
+    // entry, so its button never rendered.
+    'vercel-ai-gateway',
+    'chutes',
+    'nvidia',
+    'ollama',
+    'openrouter',
   ])
 
   // canListLiveModels mirrors the backend's list of providers with a live
@@ -2553,7 +2775,7 @@
   let canListLiveModels = $derived(
     providerId.startsWith('openai-compatible-') ||
       isCompatibleNode ||
-      ['antigravity', 'gemini-cli', 'cline', 'clinepass', 'qoder', 'qoder-cn'].includes(providerId) ||
+      ['antigravity', 'gemini-cli', 'cline', 'clinepass', 'qoder', 'qoder-cn', 'zed'].includes(providerId) ||
       ModelsListURLs.has(providerId)
   )
 
@@ -2852,6 +3074,22 @@
             Delete
           </button>
         </div>
+      </div>
+      <!-- Status only: the policy is edited in the node's dialog (the same fields as
+           Name and Base URL there), so this line answers "what is this node allowed"
+           without turning the page into a form. -->
+      <div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-text-muted">
+        <span class="font-medium text-text-main">Capacity</span>
+        <span class="font-mono">{nodeLimitsSummary(nodeLimitsDraftOf(selectedNode.limits ?? null))}</span>
+        {#if selectedNode.limits}
+          <span class="text-text-subtle">·</span>
+          <span class="font-mono">{nodeLimitsUsageSummary(selectedNode.limits)}</span>
+          {#if selectedNode.limits.expired}
+            <Badge tone="error">Contract ended</Badge>
+          {:else if selectedNode.limits.tokenQuota > 0 && selectedNode.limits.usedTokens >= selectedNode.limits.tokenQuota}
+            <Badge tone="error">Quota spent</Badge>
+          {/if}
+        {/if}
       </div>
     </div>
   {/if}
@@ -3491,6 +3729,14 @@
                         disabled={isTestingOneByOne || status?.state === 'testing'}
                         onSelect={() => refreshOneConnection(conn)}
                       />
+                      {#if isDeepSeekWeb}
+                        <MenuItem
+                          label="Renew credential"
+                          icon="lock_reset"
+                          disabled={renewingConnId === conn.id}
+                          onSelect={() => renewDeepSeekCredential(conn)}
+                        />
+                      {/if}
                       <MenuItem label="Edit" icon="edit" onSelect={() => openEditConnection(conn)} />
 
                       <div class="my-1 border-t border-border-subtle" role="separator"></div>
@@ -3591,9 +3837,20 @@
             type="text"
             bind:value={newCompatibleModel}
             onkeydown={(e) => { if (e.key === 'Enter') handleAddCompatibleModel() }}
-            placeholder={isAnthropicCompatibleNode ? 'claude-3-opus-20240229' : 'gpt-4o'}
+            placeholder={isAnthropicCompatibleNode ? 'claude-3-opus-20240229' : 'gpt-4o — paste a list for several'}
             class="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary"
           />
+          {#if newCompatibleModelsPlan.ids.length > 1 || newCompatibleModelsPlan.invalid.length > 0}
+            <p class="text-xs text-text-muted mt-1">
+              {newCompatibleModelsPlan.ids.length} id{newCompatibleModelsPlan.ids.length === 1 ? '' : 's'} to add
+              {#if newCompatibleModelsPlan.duplicates.length > 0}
+                · {newCompatibleModelsPlan.duplicates.length} repeated
+              {/if}
+              {#if newCompatibleModelsPlan.invalid.length > 0}
+                · {newCompatibleModelsPlan.invalid.length} rejected (no slash, pipe or quotes in an id)
+              {/if}
+            </p>
+          {/if}
         </div>
         <button
           type="button"
@@ -3606,7 +3863,7 @@
         </button>
         <button
           type="button"
-          onclick={handleImportCompatibleModels}
+          onclick={() => handleImportCompatibleModels(false)}
           disabled={!canImportCompatible || isImportingCompatibleModels}
           class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 active:scale-[0.97] bg-surface-2 hover:bg-surface-3 text-text-main border border-border h-8 px-4 text-xs rounded-[8px]"
         >
@@ -3615,23 +3872,42 @@
         </button>
         <button
           type="button"
+          onclick={() => handleImportCompatibleModels(true)}
+          disabled={!canImportCompatible || isImportingCompatibleModels}
+          class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer active:scale-[0.97] bg-surface-2 hover:bg-surface-3 text-text-main border border-border h-8 px-4 text-xs rounded-[8px] disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <span class="material-symbols-outlined text-[18px]">savings</span>
+          Import free only
+        </button>
+        <button
+          type="button"
           onclick={isTestingAllCompatibleModels ? cancelCompatibleSweep : handleTestAllCompatibleModels}
-          disabled={!isTestingAllCompatibleModels && compatibleRows.length === 0}
+          disabled={!isTestingAllCompatibleModels && (compatibleRows.length === 0 || compatibleTestAllRunning)}
           title={isTestingAllCompatibleModels
             ? 'Stop testing. Models already checked keep their result.'
             : 'Probe every model of this provider, one at a time'}
-          class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 active:scale-[0.97] border h-8 px-4 text-xs rounded-[8px] {isTestingAllCompatibleModels
+          class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer active:scale-[0.97] border h-8 px-4 text-xs rounded-[8px] disabled:opacity-50 disabled:cursor-not-allowed {isTestingAllCompatibleModels
             ? 'border-red-500/40 bg-red-500/10 text-red-500 hover:bg-red-500/15'
             : 'bg-surface-2 hover:bg-surface-3 text-text-main border-border'}"
         >
-          <span
-            class="material-symbols-outlined text-[18px] {isTestingAllCompatibleModels
-              ? ''
-              : ''}"
-          >
+          <span class="material-symbols-outlined text-[18px]">
             {isTestingAllCompatibleModels ? 'progress_activity' : 'science'}
           </span>
-          {isTestingAllCompatibleModels ? 'Cancel' : 'Test All Models'}
+          {isTestingAllCompatibleModels
+            ? 'Cancel'
+            : compatibleTestAllRunning
+              ? `Testing ${compatibleTestSummary.total}/${compatibleRows.length}...`
+              : 'Test all models'}
+        </button>
+        <button
+          type="button"
+          onclick={handleRemoveAllCompatibleModels}
+          disabled={compatibleRows.length === 0 || isRemovingCompatibleModels || compatibleTestAllRunning}
+          title="Delete every model imported into this node, in one request"
+          class="inline-flex items-center justify-center gap-2 font-semibold transition-all duration-150 ease-out cursor-pointer active:scale-[0.97] bg-surface-2 hover:bg-red-500/10 text-text-main hover:text-red-500 border border-border h-8 px-4 text-xs rounded-[8px] disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <span class="material-symbols-outlined text-[18px]">{isRemovingCompatibleModels ? 'progress_activity' : 'delete_sweep'}</span>
+          {isRemovingCompatibleModels ? 'Removing...' : 'Remove all models'}
         </button>
       </div>
       {#if allCompatibleTestSummary}
@@ -3647,7 +3923,8 @@
           {formatSweepOutcome(allCompatibleTestSummary)}
         </div>
       {/if}
-
+      <p class="text-xs text-text-muted">Test all sends a real completion per model and consumes account quota.</p>
+      <p class="text-xs text-text-muted">Remove all deletes this node's imported models and the aliases pointing at them; models that ship with the build stay.</p>
       {#if !canImportCompatible}
         <p class="text-xs text-text-muted">Add a connection to enable importing models.</p>
       {/if}
@@ -3656,13 +3933,13 @@
           {#each compatibleRows as row (row.source + ':' + row.id)}
             {@const tStatus = compatibleTestResults[row.id]}
             {@const tError = compatibleTestErrors[row.id]}
-            {@const isTestingRow = compatibleTestId === row.id}
-            <div class="flex items-start gap-3 p-3 rounded-lg border {tStatus === 'ok' ? 'border-green-500/40' : tStatus === 'error' ? 'border-red-500/40' : 'border-border'} hover:bg-sidebar/50">
+            {@const isTestingRow = compatibleTesting[row.id]}
+            <div class="flex items-start gap-3 p-3 rounded-lg border {tStatus === 'ok' ? 'border-green-500/40' : tStatus === 'blocked' ? 'border-amber-500/40' : tStatus === 'error' ? 'border-red-500/40' : 'border-border'} hover:bg-sidebar/50">
               <span
                 class="material-symbols-outlined text-base text-text-muted mt-0.5"
-                style={tStatus === 'ok' ? 'color:#22c55e' : tStatus === 'error' ? 'color:#ef4444' : undefined}
+                style={tStatus === 'ok' ? 'color:#22c55e' : tStatus === 'blocked' ? 'color:#f59e0b' : tStatus === 'error' ? 'color:#ef4444' : undefined}
               >
-                {tStatus === 'ok' ? 'check_circle' : tStatus === 'error' ? 'cancel' : 'smart_toy'}
+                {tStatus === 'ok' ? 'check_circle' : tStatus === 'blocked' ? 'schedule' : tStatus === 'error' ? 'cancel' : 'smart_toy'}
               </span>
               <div class="flex-1 min-w-0">
                 <p class="text-sm font-medium truncate">{row.id}</p>
@@ -3696,6 +3973,9 @@
                         {isTestingRow ? 'Testing...' : 'Test'}
                       </span>
                     </div>
+                  {/if}
+                  {#if tStatus && compatibleTestLatency[row.id] !== undefined}
+                    <span class="text-xs text-text-muted font-mono">{compatibleTestLatency[row.id]} ms</span>
                   {/if}
                 </div>
                 {#if tError}
@@ -3991,7 +4271,7 @@
         Add Model
       </button>
 
-      {#if (providerId === 'cline' || providerId === 'clinepass' || providerId === 'qoder' || providerId === 'qoder-cn') && providerConnections.some((c) => c.isActive !== 0)}
+      {#if (providerId === 'cline' || providerId === 'clinepass' || providerId === 'qoder' || providerId === 'qoder-cn' || providerId === 'commandcode' || providerId === 'vercel-ai-gateway' || providerId === 'chutes' || providerId === 'nvidia' || providerId === 'ollama' || providerId === 'openrouter') && providerConnections.some((c) => c.isActive !== 0)}
         <button
           type="button"
           onclick={handleImportLiveCatalogModels}
@@ -4615,6 +4895,7 @@
   providerAlias={storageAlias}
   onClose={() => (showAddCustomModelModal = false)}
   onSave={submitAddCustomModel}
+  onBulkSaved={handleBulkModelsSaved}
 />
 {/if}
 
@@ -4632,6 +4913,9 @@
   isAnthropic={isAnthropicCompatibleNode}
   onClose={() => (showEditNodeModal = false)}
   onSave={handleSaveEditedNode}
+  onLimitsSaved={(limits) => {
+    selectedNode = selectedNode ? { ...selectedNode, limits } : selectedNode
+  }}
 />
 
 <!-- 6. Add Key Connection Modal (for non-oauth providers) -->

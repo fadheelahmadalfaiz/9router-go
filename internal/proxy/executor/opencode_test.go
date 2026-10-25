@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
@@ -34,6 +35,243 @@ func TestInjectReasoningContent(t *testing.T) {
 	}
 }
 
+func TestInjectReasoningContent_StripsUnsupportedMessageReasoning(t *testing.T) {
+	// Simulates conversation replay where assistant turns have replayed "reasoning"
+	// or other foreign keys that OpenCode upstream rejects with 400 unsupported_parameter.
+	input := []byte(`{
+		"model": "beam-free",
+		"messages": [
+			{"role": "assistant", "content": ""},
+			{"role": "tool", "content": "{\"output\":\"commit 5264cd\"}", "reasoning": "stray"},
+			{"role": "assistant", "content": "", "reasoning": "I should inspect the commit log", "annotations": []},
+			{"role": "tool", "content": "{\"output\":\"38c61d\"}"},
+			{"role": "assistant", "content": "", "reasoning": {"effort": "high"}}
+		]
+	}`)
+
+	res := InjectReasoningContent(input, "opencode")
+
+	var reqMap map[string]any
+	if err := json.Unmarshal(res, &reqMap); err != nil {
+		t.Fatalf("failed to parse output: %v", err)
+	}
+
+	msgs, ok := reqMap["messages"].([]any)
+	if !ok || len(msgs) != 5 {
+		t.Fatalf("expected 5 messages, got %v", msgs)
+	}
+
+	// Check every message: none should have "reasoning" or "annotations"
+	for idx, raw := range msgs {
+		m := raw.(map[string]any)
+		if _, hasReasoning := m["reasoning"]; hasReasoning {
+			t.Errorf("messages[%d] still has 'reasoning': %v", idx, m)
+		}
+		if _, hasAnnotations := m["annotations"]; hasAnnotations {
+			t.Errorf("messages[%d] still has 'annotations': %v", idx, m)
+		}
+	}
+
+	// messages[2] had reasoning string -> promoted to reasoning_content
+	m2 := msgs[2].(map[string]any)
+	if rc, ok := m2["reasoning_content"].(string); !ok || rc != "I should inspect the commit log" {
+		t.Errorf("messages[2].reasoning_content = %v, want 'I should inspect the commit log'", m2["reasoning_content"])
+	}
+
+	// messages[4] had object reasoning -> injected default placeholder " "
+	m4 := msgs[4].(map[string]any)
+	if rc, ok := m4["reasoning_content"].(string); !ok || rc != " " {
+		t.Errorf("messages[4].reasoning_content = %v, want ' '", m4["reasoning_content"])
+	}
+}
+
+func TestForwardOpencode_StripsReplayedMessageReasoning(t *testing.T) {
+	var upstreamReceived map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &upstreamReceived); err != nil {
+			t.Errorf("failed to unmarshal upstream request: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	cfg := &providers.ProviderConfig{
+		BaseURL: srv.URL + "/inference/v1/chat/completions",
+	}
+
+	rec := httptest.NewRecorder()
+	// Replay payload with messages[2].reasoning matching user's issue with combo-wombo beam-free
+	req := &Request{
+		Client:   srv.Client(),
+		Config:   cfg,
+		APIKey:   "public",
+		IsStream: false,
+		Body: []byte(`{
+			"model": "beam-free",
+			"messages": [
+				{"role": "assistant", "content": ""},
+				{"role": "tool", "content": "{\"output\": \"test\"}"},
+				{"role": "assistant", "content": "", "reasoning": "planning git command", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]},
+				{"role": "tool", "tool_call_id": "c1", "content": "{\"output\": \"done\"}"}
+			]
+		}`),
+	}
+
+	err := ForwardOpencode(rec, req)
+	if err != nil {
+		t.Fatalf("ForwardOpencode failed: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+
+	if upstreamReceived == nil {
+		t.Fatal("upstream never received body")
+	}
+
+	msgs, ok := upstreamReceived["messages"].([]any)
+	if !ok || len(msgs) < 3 {
+		t.Fatalf("expected messages array with >= 3 items, got %v", upstreamReceived["messages"])
+	}
+
+	for i, raw := range msgs {
+		m := raw.(map[string]any)
+		if _, has := m["reasoning"]; has {
+			t.Errorf("upstream request messages[%d] must not carry 'reasoning' field: %v", i, m)
+		}
+	}
+
+	// Find the assistant message that originally carried reasoning
+	var foundAssistantWithReasoningContent bool
+	for _, raw := range msgs {
+		m := raw.(map[string]any)
+		if m["role"] == "assistant" {
+			if rc, _ := m["reasoning_content"].(string); rc == "planning git command" {
+				foundAssistantWithReasoningContent = true
+			}
+		}
+	}
+	if !foundAssistantWithReasoningContent {
+		t.Errorf("expected to find assistant message with reasoning_content 'planning git command' in upstream request: %v", msgs)
+	}
+}
+
+func TestLiveE2E_Opencode_BeamFree_ToolCall(t *testing.T) {
+	if os.Getenv("ROUTER_LIVE_E2E") == "" {
+		t.Skip("skipping live OpenCode network test (set ROUTER_LIVE_E2E=1 to run)")
+	}
+
+	baseURL := os.Getenv("OPENCODE_RELAY_URL")
+	var staticHeaders map[string]string
+	if baseURL == "" {
+		baseURL = "https://rifa-vercel-e2db26du0-rifa12.vercel.app"
+		staticHeaders = map[string]string{"x-relay-target": "https://opencode.ai"}
+	}
+	cfg := &providers.ProviderConfig{
+		BaseURL:       baseURL,
+		StaticHeaders: staticHeaders,
+	}
+	// Turn 1: user requests weather with tool definition
+	rec1 := httptest.NewRecorder()
+	req1 := &Request{
+		Client:   http.DefaultClient,
+		Config:   cfg,
+		APIKey:   "public",
+		IsStream: false,
+		Body: []byte(`{
+			"model": "beam-free",
+			"messages": [
+				{"role": "user", "content": "What is the weather in Tokyo? Please use the get_weather tool."}
+			],
+			"tools": [
+				{
+					"type": "function",
+					"function": {
+						"name": "get_weather",
+						"description": "Get current weather for a city",
+						"parameters": {
+							"type": "object",
+							"properties": {
+								"city": {"type": "string"}
+							},
+							"required": ["city"]
+						}
+					}
+				}
+			]
+		}`),
+	}
+
+	err := ForwardOpencode(rec1, req1)
+	if err != nil {
+		t.Fatalf("Turn 1 ForwardOpencode failed: %v", err)
+	}
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("Turn 1 status = %d: %s", rec1.Code, rec1.Body.String())
+	}
+	t.Logf("Turn 1 response: %s", rec1.Body.String())
+
+	// Turn 2: replay conversation with tool call and injected reasoning field on the assistant message
+	rec2 := httptest.NewRecorder()
+	req2 := &Request{
+		Client:   http.DefaultClient,
+		Config:   cfg,
+		APIKey:   "public",
+		IsStream: false,
+		Body: []byte(`{
+			"model": "beam-free",
+			"messages": [
+				{"role": "user", "content": "What is the weather in Tokyo?"},
+				{
+					"role": "assistant",
+					"content": "",
+					"reasoning": "I need to check the weather in Tokyo using get_weather",
+					"tool_calls": [
+						{
+							"id": "call_tokyo_123",
+							"type": "function",
+							"function": {"name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}"}
+						}
+					]
+				},
+				{
+					"role": "tool",
+					"tool_call_id": "call_tokyo_123",
+					"content": "{\"temperature\": 22, \"condition\": \"Sunny\"}"
+				}
+			],
+			"tools": [
+				{
+					"type": "function",
+					"function": {
+						"name": "get_weather",
+						"description": "Get current weather for a city",
+						"parameters": {
+							"type": "object",
+							"properties": {
+								"city": {"type": "string"}
+							},
+							"required": ["city"]
+						}
+					}
+				}
+			]
+		}`),
+	}
+
+	err = ForwardOpencode(rec2, req2)
+	if err != nil {
+		t.Fatalf("Turn 2 ForwardOpencode failed: %v", err)
+	}
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("Turn 2 status = %d: %s", rec2.Code, rec2.Body.String())
+	}
+	t.Logf("Turn 2 response: %s", rec2.Body.String())
+}
+
 func TestForwardOpencode(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer public" {
@@ -42,19 +280,42 @@ func TestForwardOpencode(t *testing.T) {
 		if r.Header.Get("x-opencode-client") != "cli" {
 			t.Errorf("expected cli client header, got %s", r.Header.Get("x-opencode-client"))
 		}
-		if len(r.Header.Get("x-opencode-project")) != 40 {
-			t.Errorf("expected 40-char hex x-opencode-project, got %s", r.Header.Get("x-opencode-project"))
+		if r.Header.Get("x-opencode-project") != "global" {
+			t.Errorf("expected x-opencode-project global like upstream, got %s", r.Header.Get("x-opencode-project"))
 		}
 		if !strings.HasPrefix(r.Header.Get("x-opencode-session"), "ses_") {
 			t.Errorf("expected ses_ prefix on x-opencode-session, got %s", r.Header.Get("x-opencode-session"))
 		}
-		if !strings.HasPrefix(r.Header.Get("x-opencode-request"), "msg_") {
-			t.Errorf("expected msg_ prefix on x-opencode-request, got %s", r.Header.Get("x-opencode-request"))
+		if r.Header.Get("x-opencode-request") != "" {
+			t.Errorf("v2 request must omit x-opencode-request, got %q", r.Header.Get("x-opencode-request"))
+		}
+		if r.Header.Get("x-opencode-session-id") != r.Header.Get("x-opencode-session") || r.Header.Get("x-session-affinity") != r.Header.Get("x-opencode-session") || r.Header.Get("x-session-id") != r.Header.Get("x-opencode-session") {
+			t.Errorf("session affinity headers do not match: %#v", r.Header)
 		}
 		if r.Header.Get("User-Agent") != proxy.DefaultOpenCodeUA {
 			t.Errorf("expected User-Agent %s, got %s", proxy.DefaultOpenCodeUA, r.Header.Get("User-Agent"))
 		}
 		body, _ := io.ReadAll(r.Body)
+		var parsed map[string]any
+		if err := json.Unmarshal(body, &parsed); err == nil {
+			if parsed["tool_choice"] == "none" {
+				t.Errorf("OpenCode v2 rejects tool_choice none: %s", body)
+			}
+			tools, _ := parsed["tools"].([]any)
+			for _, name := range []string{"read", "shell"} {
+				found := false
+				for _, tool := range tools {
+					tm, _ := tool.(map[string]any)
+					fn, _ := tm["function"].(map[string]any)
+					if fn["name"] == name {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("missing v2 fingerprint tool %q: %s", name, body)
+				}
+			}
+		}
 		if !strings.Contains(string(body), `"reasoning_content":" "`) {
 			t.Errorf("expected reasoning_content injected in request body, got %s", string(body))
 		}
@@ -87,6 +348,83 @@ func TestForwardOpencode(t *testing.T) {
 	}
 }
 
+// A harness body — Claude-Code-style capitalised tools, a forced tool_choice,
+// a tool without a schema, and a foreign cache_control key — is canonicalized
+// into exactly what the v2 inference gate accepts, so the same model works
+// whether the caller is a clean API client or an agent harness
+// (decolua/9router#4842 gate rules).
+func TestForwardOpencode_HarnessBodyIsCanonicalizedForTheGate(t *testing.T) {
+	var sent map[string]any
+	var sentRaw string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		sentRaw = string(raw)
+		_ = json.Unmarshal(raw, &sent)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"ok"}}]}` + "\n\ndata: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	cfg := &providers.ProviderConfig{
+		BaseURL: srv.URL + "/zen/v1/chat/completions",
+	}
+
+	rec := httptest.NewRecorder()
+	req := &Request{
+		Client: srv.Client(),
+		Config: cfg,
+		APIKey: "",
+		Body: []byte(`{"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"hi"}],` +
+			`"tools":[{"type":"function","function":{"name":"Read","description":"caller Read"}},` +
+			`{"type":"function","function":{"name":"Task","description":"t","parameters":{"type":"object","properties":{"path":{"type":"string"}},"cache_control":{"type":"ephemeral"}}}}],` +
+			`"tool_choice":{"type":"function","function":{"name":"Task"}},"parallel_tool_calls":false}`),
+		IsStream:      false,
+		TranslateResp: false,
+	}
+
+	if err := ForwardOpencode(rec, req); err != nil {
+		t.Fatalf("ForwardOpencode failed: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if sent == nil {
+		t.Fatal("upstream received no body")
+	}
+	tools, _ := sent["tools"].([]any)
+	if len(tools) != 4 {
+		t.Fatalf("want caller Read+Task plus injected read+shell, got %d: %s", len(tools), sentRaw)
+	}
+	names := map[string]bool{}
+	for _, tool := range tools {
+		tm, _ := tool.(map[string]any)
+		fn, _ := tm["function"].(map[string]any)
+		if fn == nil {
+			t.Errorf("chat lane lost the .function wrapper: %s", sentRaw)
+			continue
+		}
+		name, _ := fn["name"].(string)
+		names[name] = true
+		params, _ := fn["parameters"].(map[string]any)
+		if params == nil || params["type"] != "object" {
+			t.Errorf("tool %q reached the gate without an object schema: %s", name, sentRaw)
+		}
+	}
+	for _, want := range []string{"Read", "Task", "read", "shell"} {
+		if !names[want] {
+			t.Errorf("tool %q missing from the gate request: %s", want, sentRaw)
+		}
+	}
+	choice, ok := sent["tool_choice"].(map[string]any)
+	if !ok {
+		t.Fatalf("forced tool_choice must survive on the chat lane, got %v: %s", sent["tool_choice"], sentRaw)
+	}
+	if fn, _ := choice["function"].(map[string]any); fn["name"] != "Task" {
+		t.Errorf("forced choice name=%v, want Task: %s", fn["name"], sentRaw)
+	}
+}
+
 func TestForwardOpencode_MuseSpark_EdgeRelay(t *testing.T) {
 	var gotTarget, gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -101,7 +439,7 @@ func TestForwardOpencode_MuseSpark_EdgeRelay(t *testing.T) {
 	defer srv.Close()
 
 	cfg := &providers.ProviderConfig{
-		BaseURL: srv.URL, // relay host
+		BaseURL: srv.URL, // local fake upstream; leave its path intact
 		StaticHeaders: map[string]string{
 			"x-relay-target": "https://opencode.ai",
 			"x-relay-path":   "/zen/v1/chat/completions",
@@ -125,8 +463,8 @@ func TestForwardOpencode_MuseSpark_EdgeRelay(t *testing.T) {
 	if gotTarget != "https://opencode.ai" {
 		t.Errorf("expected x-relay-target 'https://opencode.ai', got %q", gotTarget)
 	}
-	if gotPath != "/zen/v1/responses" {
-		t.Errorf("expected x-relay-path '/zen/v1/responses', got %q", gotPath)
+	if gotPath != "/inference/v1/responses" {
+		t.Errorf("expected x-relay-path '/inference/v1/responses', got %q", gotPath)
 	}
 }
 
@@ -134,6 +472,12 @@ func TestForwardOpencodeGo_OpenAIRouting(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer secret-go-key" {
 			t.Errorf("expected Authorization Bearer secret-go-key header, got %s", r.Header.Get("Authorization"))
+		}
+		// The paid go lane keeps the v1 identity: only the keyless free
+		// executor moved to v2 (upstream decolua/9router#4842 leaves keyed
+		// executors untouched).
+		if r.Header.Get("User-Agent") != proxy.DefaultOpenCodeV1UA {
+			t.Errorf("expected paid-lane User-Agent %s, got %s", proxy.DefaultOpenCodeV1UA, r.Header.Get("User-Agent"))
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -166,8 +510,8 @@ func TestForwardOpencodeGo_OpenAIRouting(t *testing.T) {
 
 func TestForwardOpencode_MuseSparkResponsesRouting(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/responses") {
-			t.Errorf("expected path ending in /responses, got %s", r.URL.Path)
+		if !strings.HasSuffix(r.URL.Path, "/inference/v1/responses") {
+			t.Errorf("expected the zen base to be rewritten to the inference gate, got %s", r.URL.Path)
 		}
 		body, _ := io.ReadAll(r.Body)
 		var parsed map[string]any
@@ -184,7 +528,7 @@ func TestForwardOpencode_MuseSparkResponsesRouting(t *testing.T) {
 	defer srv.Close()
 
 	cfg := &providers.ProviderConfig{
-		BaseURL: srv.URL + "/chat/completions",
+		BaseURL: srv.URL + "/zen/v1/chat/completions",
 	}
 
 	rec := httptest.NewRecorder()
@@ -209,7 +553,7 @@ func TestForwardOpencode_MuseSparkResponsesRouting(t *testing.T) {
 func TestForwardOpencode_MuseSpark13_ResponsesRouting(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/responses") {
-			t.Errorf("expected /responses for muse-spark-1.3, got %s", r.URL.Path)
+			t.Errorf("expected responses endpoint, got %s", r.URL.Path)
 		}
 		body, _ := io.ReadAll(r.Body)
 		var parsed map[string]any
@@ -235,6 +579,230 @@ func TestForwardOpencode_MuseSpark13_ResponsesRouting(t *testing.T) {
 	}
 	if rec.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", rec.Code)
+	}
+}
+
+func TestOpenCodeInferenceBase(t *testing.T) {
+	tests := []struct{ input, want string }{
+		{"https://opencode.ai/zen/v1/chat/completions", "https://opencode.ai/inference/v1"},
+		{"https://opencode.ai/zen/v1", "https://opencode.ai/inference/v1"},
+		{"http://127.0.0.1:9000/zen/v1/chat/completions", "http://127.0.0.1:9000/inference/v1"},
+		{"http://127.0.0.1:9000", "http://127.0.0.1:9000"},
+		{"https://relay.example/api", "https://relay.example/api"},
+		{"https://opencode.ai/inference/v1", "https://opencode.ai/inference/v1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := opencodeInferenceBase(tt.input); got != tt.want {
+				t.Errorf("opencodeInferenceBase(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsOpencodeResponsesModel(t *testing.T) {
+	// Ports the upstream free-executor lane rule (isResponsesModel = curated
+	// set plus isMuseSparkModel /^muse[-_]?spark(?:$|[-_:.\s])/i).
+	tests := []struct {
+		model string
+		want  bool
+	}{
+		{"muse-spark-1.2-contributor-free", true},
+		{"muse-spark-1.3-contributor-free", true},
+		{"muse-spark-1.3-contributor-free(xhigh)", true},
+		{"muse-spark-1.4-contributor-free", true},
+		{"muse-spark-2.0-contributor-free", true},
+		{"jev-1.13-free", false},
+		{"space-bunny-free", false},
+		{"big-pickle", false},
+		{"grok-4.6", false},
+		{"gpt-5.6-luna", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			if got := isOpencodeResponsesModel(tt.model); got != tt.want {
+				t.Errorf("isOpencodeResponsesModel(%q) = %v, want %v", tt.model, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsOpencodeGoResponsesModel(t *testing.T) {
+	// The paid go lane keeps its pre-v2 predicate: narrowing it to the free
+	// ids would silently move paid traffic to the chat lane.
+	tests := []struct {
+		model string
+		want  bool
+	}{
+		{"muse-spark-1.2-contributor", true},
+		{"muse-spark-1.3-contributor", true},
+		{"muse-spark-1.2-contributor-free", true},
+		{"grok-4.6", true},
+		{"gpt-5.6-luna", true},
+		{"space-bunny-free", false},
+		{"glm-5.2", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			if got := isOpencodeGoResponsesModel(tt.model); got != tt.want {
+				t.Errorf("isOpencodeGoResponsesModel(%q) = %v, want %v", tt.model, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsOpencodeFreeModel(t *testing.T) {
+	tests := []struct {
+		model string
+		want  bool
+	}{
+		{"big-pickle", false},
+		{"big-pickle(high)", false},
+		{"longcat-2.5-preview-free", true},
+		{"longcat-2.5-preview-free(thinking)", true},
+		{"deepseek-v4-flash-free", true},
+		{"muse-spark-1.3-contributor-free", true},
+		{"space-bunny-free", true},
+		{"jev-1.13-free", true},
+		{"deepseek-v4-pro", false},
+		{"grok-4.6", false},
+		{"gpt-5.6-luna", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			if got := isOpencodeFreeModel(tt.model); got != tt.want {
+				t.Errorf("isOpencodeFreeModel(%q) = %v, want %v", tt.model, got, tt.want)
+			}
+		})
+	}
+}
+
+// A paid go Muse Spark model must stay on the go Responses lane with the v1
+// identity — the free-executor narrowing must never leak into this lane.
+func TestForwardOpencodeGo_MuseSparkResponsesRouting(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/zen/go/v1/responses") {
+			t.Errorf("expected paid go responses lane, got %s", r.URL.Path)
+		}
+		if r.Header.Get("User-Agent") != proxy.DefaultOpenCodeV1UA {
+			t.Errorf("expected paid-lane User-Agent %s, got %s", proxy.DefaultOpenCodeV1UA, r.Header.Get("User-Agent"))
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(responsesEventStream("go spark ok")))
+	}))
+	defer srv.Close()
+
+	cfg := &providers.ProviderConfig{BaseURL: srv.URL + "/zen/go/v1/chat/completions"}
+	rec := httptest.NewRecorder()
+	req := &Request{
+		Client: srv.Client(), Config: cfg, APIKey: "secret-go-key",
+		Body:     []byte(`{"model":"muse-spark-1.2-contributor","messages":[{"role":"user","content":"hi"}]}`),
+		IsStream: false, TranslateResp: false,
+	}
+	if err := ForwardOpencodeGo(rec, req); err != nil {
+		t.Fatalf("ForwardOpencodeGo failed: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", rec.Code)
+	}
+}
+
+// space-bunny-free 403s on the keyed go lane, so it takes the keyless
+// inference chat lane with public credentials — never the user's go key.
+func TestForwardOpencodeGo_SpaceBunnyFreeTakesInferenceGate(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/inference/v1/chat/completions") {
+			t.Errorf("expected inference chat lane, got %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer public" {
+			t.Errorf("expected Bearer public, got %s", r.Header.Get("Authorization"))
+		}
+		if r.Header.Get("User-Agent") != proxy.DefaultOpenCodeUA {
+			t.Errorf("expected v2 User-Agent %s, got %s", proxy.DefaultOpenCodeUA, r.Header.Get("User-Agent"))
+		}
+		if r.Header.Get("x-opencode-client") != "cli" {
+			t.Errorf("expected cli client header, got %s", r.Header.Get("x-opencode-client"))
+		}
+		body, _ := io.ReadAll(r.Body)
+		var parsed map[string]any
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if parsed["model"] != "space-bunny-free" {
+			t.Errorf("expected bare model id, got %v", parsed["model"])
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"bunny"}}]}` + "\n\ndata: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	cfg := &providers.ProviderConfig{BaseURL: srv.URL + "/zen/go/v1/chat/completions"}
+	rec := httptest.NewRecorder()
+	req := &Request{
+		Client: srv.Client(), Config: cfg, APIKey: "secret-go-key",
+		Body:     []byte(`{"model":"opencode-go/space-bunny-free","messages":[{"role":"user","content":"hi"}]}`),
+		IsStream: false, TranslateResp: false,
+	}
+	if err := ForwardOpencodeGo(rec, req); err != nil {
+		t.Fatalf("ForwardOpencodeGo failed: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", rec.Code)
+	}
+}
+
+func TestForwardOpencodeGo_GeminiWire(t *testing.T) {
+	var capturedPath string
+	var capturedAPIKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path + "?" + r.URL.RawQuery
+		capturedAPIKey = r.Header.Get("x-goog-api-key")
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{
+			"candidates": [{
+				"content": {
+					"parts": [{"text": "Hello from Gemini 4 Argon on OpenCode Go"}],
+					"role": "model"
+				},
+				"finishReason": "STOP",
+				"index": 0
+			}],
+			"usageMetadata": {
+				"promptTokenCount": 5,
+				"candidatesTokenCount": 8,
+				"totalTokenCount": 13
+			}
+		}`))
+	}))
+	defer srv.Close()
+
+	cfg := &providers.ProviderConfig{BaseURL: srv.URL + "/inference/go/v1/models"}
+	rec := httptest.NewRecorder()
+	req := &Request{
+		Client: srv.Client(), Config: cfg, APIKey: "test-goog-key",
+		Body:     []byte(`{"model":"opencode-go/gemini-4-argon-contributor","messages":[{"role":"user","content":"hi"}]}`),
+		IsStream: false, TranslateResp: false,
+	}
+	if err := ForwardOpencodeGo(rec, req); err != nil {
+		t.Fatalf("ForwardOpencodeGo failed: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", rec.Code)
+	}
+	if !strings.Contains(capturedPath, "/gemini-4-argon-contributor:generateContent") {
+		t.Errorf("expected path to contain /gemini-4-argon-contributor:generateContent, got %s", capturedPath)
+	}
+	if capturedAPIKey != "test-goog-key" {
+		t.Errorf("expected x-goog-api-key test-goog-key, got %s", capturedAPIKey)
+	}
+	if !strings.Contains(rec.Body.String(), "Hello from Gemini 4 Argon on OpenCode Go") {
+		t.Errorf("expected response to contain translated text, got %s", rec.Body.String())
 	}
 }
 
@@ -496,4 +1064,72 @@ func responsesEventStream(text string) string {
 		`data: {"type":"response.output_text.delta","delta":"` + text + `"}` + "\n\n" +
 		"event: response.completed\n" +
 		`data: {"type":"response.completed"}` + "\n\n"
+}
+
+// Two hint-less requests on one connection must share one upstream session:
+// the free tier accounts its quota per session, so a fresh id per request
+// burns through it and surfaces as 429 FreeUsageLimitError with a growing
+// retry-after (decolua/9router stableSessionId; dsh-our-free-model
+// sessionForConversation).
+func TestForwardOpencode_StableSessionPerConnection(t *testing.T) {
+	var sessions []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sessions = append(sessions, r.Header.Get("x-opencode-session"))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"msg_1","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer srv.Close()
+
+	cfg := &providers.ProviderConfig{BaseURL: srv.URL}
+	for range 2 {
+		rec := httptest.NewRecorder()
+		req := &Request{
+			Client:       srv.Client(),
+			Config:       cfg,
+			ConnectionID: "conn-stable-1",
+			Body:         []byte(`{"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"hi"}]}`),
+		}
+		if err := ForwardOpencode(rec, req); err != nil {
+			t.Fatalf("ForwardOpencode failed: %v", err)
+		}
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("expected 2 upstream requests, got %d", len(sessions))
+	}
+	if sessions[0] == "" || sessions[0] != sessions[1] {
+		t.Errorf("expected one stable session per connection, got %q then %q", sessions[0], sessions[1])
+	}
+	if !proxy.OpenCodeSessionRegex.MatchString(sessions[0]) ||
+		!proxy.OpenCodeSessionDescendingRegex.MatchString(sessions[0][4:16]) {
+		t.Errorf("session %q is not a canonical descending id", sessions[0])
+	}
+}
+
+// A caller that suppresses tools with tool_choice "none" must not have that
+// field forwarded: the v2 inference gate answers it with 403 FreeTierError
+// (upstream opencodeFingerprint.js; measured by dsh-our-free-model).
+func TestForwardOpencode_DropsCallerToolChoiceNone(t *testing.T) {
+	var sent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		sent = string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"msg_1","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer srv.Close()
+
+	rec := httptest.NewRecorder()
+	req := &Request{
+		Client: srv.Client(),
+		Config: &providers.ProviderConfig{BaseURL: srv.URL},
+		Body:   []byte(`{"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"hi"}],"tool_choice":"none"}`),
+	}
+	if err := ForwardOpencode(rec, req); err != nil {
+		t.Fatalf("ForwardOpencode failed: %v", err)
+	}
+	if strings.Contains(sent, "tool_choice") {
+		t.Errorf("tool_choice none reached the gate: %s", sent)
+	}
 }

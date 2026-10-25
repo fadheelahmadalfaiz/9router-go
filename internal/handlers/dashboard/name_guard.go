@@ -15,17 +15,28 @@ const (
 	nsCustomModel = "customModel"
 )
 
-// guardNameCollision refuses a write whose name is already taken in one of the
-// other two spaces.
+// guardNameCollision refuses a write whose bare name is already taken by the
+// other bare-name space.
 //
 // A bare model string the client sends is resolved against a model alias first
-// (resolveModel step 2), then a combo name (step 3), then a provider node
-// prefix. The alias-vs-combo pair is therefore a real shadow and stays refused.
-// The custom model is a different case: it lives at "<prefix>/<id>", so it does
-// not share an address with the bare name and is allowed to coexist with an
-// alias — see customModelAndAliasMayCoexist. Only the /v1/models listing then
-// carries both "<id>" and "<prefix>/<id>" side by side, which is a naming
-// ambiguity to be aware of, not a target that can no longer be reached.
+// (resolveModel step 2) and a combo name second (step 3), and both are writable
+// from the dashboard. The same string could therefore be written into both: the
+// alias then silently outranks the combo, so the combo answers no request at
+// all and the only symptom is a model nobody meant to reach. That is the whole
+// collision this guard exists for — one bare name, two targets, one of them
+// unreachable.
+//
+// A custom model id is not such a name. It is reached as "<node-prefix>/<id>"
+// (resolveModel step 1: the id is only ever addressed with a prefix), and
+// /v1/models publishes it in that same prefixed form, so it can neither occupy
+// a bare name nor be shadowed by one. An id colliding with an alias or a combo
+// is two distinguishable addresses, not a name that resolves to the wrong
+// target. Custom model writes are therefore not cross-checked at all —
+// refusing them is what broke "Import from /models", where a bare-name alias is
+// usually the same model on another node and a single already-aliased id in the
+// list was enough to fail the import. The refusal was also asymmetric: an alias
+// written over an existing custom id was refused while the identical pair in
+// the other order was accepted.
 //
 // Comparison is exact after trimming, matching resolution itself: resolveModel
 // looks combos up with `WHERE name = ?` and aliases by exact kv key, so
@@ -33,90 +44,59 @@ const (
 // not refuse either. It guards the write only, so rows that already collide
 // keep working — nothing is migrated or hidden.
 //
-// customModelAndAliasMayCoexist reports whether a custom model id and a model
-// alias may hold the same bare name.
-//
-// They may, and did not need to be blocked. A custom model is stored as
-// "<providerAlias>|<id>" and is addressed "<prefix>/<id>" — a different address
-// from the bare "id" the alias key owns. Resolution confirms it: a bare request
-// takes the alias at step 2 (resolveModel), and a prefixed one never reaches
-// the bare-name alias table at all, because resolvePrefixProvider matches the
-// prefix. Neither one hides the other.
-//
-// The pair that genuinely shadows is alias vs combo, and it stays refused: a
-// combo is addressed by its bare name only, so an alias of that name makes the
-// combo unreachable. The custom-model check below is kept for combos for the
-// /v1/models ambiguity reason the original comment described, which is a real
-// but much weaker concern than shadowing.
-func customModelAndAliasMayCoexist(namespace string) bool {
-	return namespace == nsCustomModel || namespace == nsModelAlias
-}
-
 // Returns true when it has already written the 409 and the caller must return.
 func (h *DashboardHandler) guardNameCollision(w http.ResponseWriter, namespace, name string) bool {
-	name = strings.TrimSpace(name)
-	if name == "" {
+	code, detail, conflict := h.nameConflict(namespace, name)
+	if !conflict {
 		return false
+	}
+	writeNameConflict(w, code, strings.TrimSpace(name), detail)
+	return true
+}
+
+// nameConflict answers what writing name into namespace would collide with,
+// without writing anything.
+//
+// It is the one definition of the rules, split out of guardNameCollision because
+// the bulk save (POST /api/models/custom with a `models` array) reports one
+// refused line per entry instead of answering one 409: sharing this decision is
+// what keeps a batch from being refused by a rule the single save would not
+// apply, or the other way round.
+func (h *DashboardHandler) nameConflict(namespace, name string) (code, detail string, conflict bool) {
+	name = strings.TrimSpace(name)
+	if name == "" || namespace == nsCustomModel {
+		return "", "", false
 	}
 
 	if namespace != nsCombo {
 		if combo, err := h.Repo.GetComboByName(name); err == nil && combo != nil {
-			writeNameConflict(w, "COMBO_NAME_CONFLICT", name,
-				"a combo named \""+name+"\" already answers to this name; a bare request for \""+name+
-					"\" is the combo, so rename the "+namespaceLabel(namespace)+" or the combo so the name addresses one target")
-			return true
+			return "COMBO_NAME_CONFLICT",
+				"a combo named \"" + name + "\" already answers to this name, and a bare request for \"" + name +
+					"\" is the combo, so the " + namespaceLabel(namespace) + " would never be reached; rename one of them",
+				true
 		}
 	}
 
-	if namespace != nsModelAlias && !customModelAndAliasMayCoexist(namespace) {
+	if namespace != nsModelAlias {
 		if target, err := h.Repo.GetModelAlias(name); err == nil && target != "" {
-			writeNameConflict(w, "MODEL_ALIAS_CONFLICT", name,
-				"a model alias \""+name+"\" already resolves this name, and an alias is consulted before a combo, "+
-					"so a combo named \""+name+"\" would be unreachable; rename the "+namespaceLabel(namespace)+
-					" or the alias so the name addresses one target")
-			return true
+			return "MODEL_ALIAS_CONFLICT",
+				"a model alias \"" + name + "\" already resolves this name, and an alias is consulted before a combo, so the combo would be unreachable; rename one of them",
+				true
 		}
 	}
 
-	if namespace != nsCustomModel && !customModelAndAliasMayCoexist(namespace) {
-		if owner, ok := customModelOwner(h, name); ok {
-			writeNameConflict(w, "CUSTOM_MODEL_NAME_CONFLICT", name,
-				"the custom model \""+owner+"/"+name+"\" already uses this id; rename one of them so the name addresses one target")
-			return true
-		}
-	}
-
-	return false
+	return "", "", false
 }
 
-// namespaceLabel names the space the caller is writing into, so a conflict
-// message can point at what the user was actually saving.
+// namespaceLabel names the bare-name space the caller is writing into, so a
+// conflict message can say which entry loses its name.
 func namespaceLabel(namespace string) string {
 	switch namespace {
-	case nsCustomModel:
-		return "custom model"
 	case nsModelAlias:
 		return "model alias"
 	default:
 		return "entry"
 	}
-}
-
-// customModelOwner returns the provider alias of a custom model carrying id,
-// reporting false when no custom model uses it. Only the id is compared: two
-// nodes may both expose "glm-5.3" as <prefix>/glm-5.3 without either shadowing
-// the other.
-func customModelOwner(h *DashboardHandler, id string) (string, bool) {
-	customs, err := h.Repo.GetCustomModels()
-	if err != nil {
-		return "", false
-	}
-	for _, cm := range customs {
-		if cm != nil && cm.ID == id {
-			return cm.ProviderAlias, true
-		}
-	}
-	return "", false
 }
 
 // writeNameConflict emits the typed 409 the connection-name guard established

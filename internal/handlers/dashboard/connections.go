@@ -138,7 +138,7 @@ const (
 // (registry features.usage).
 var usageSupportedProviders = []string{
 	"antigravity", "claude", "codebuddy-cn", "codebuddy-intl", "codex",
-	"commandcode", "deepseek", "gemini-cli", "github", "glm", "glm-cn",
+	"commandcode", "deepseek", "gemini-cli", "gemini-web", "github", "glm", "glm-cn",
 	"grok-cli", "groq", "kimi", "kiro", "minimax", "minimax-cn", "minimax-code",
 	"minimax-code-global", "ollama",
 	"opencode-go", "opencode-zen", "qoder", "qoder-cn", "trae",
@@ -148,7 +148,7 @@ var usageSupportedProviders = []string{
 // usageApikeyProviders mirrors upstream USAGE_APIKEY_PROVIDERS
 // (registry features.usageApikey).
 var usageApikeyProviders = []string{
-	"codebuddy-cn", "codebuddy-intl", "commandcode", "deepseek", "glm",
+	"codebuddy-cn", "codebuddy-intl", "commandcode", "deepseek", "gemini-web", "glm",
 	"glm-cn", "groq", "kimi", "kiro", "minimax", "minimax-cn", "ollama",
 	"opencode-go", "opencode-zen", "qoder", "qoder-cn", "vercel-ai-gateway",
 	"xiaomi-mimo",
@@ -242,8 +242,8 @@ var longTokenPattern = regexp.MustCompile(`[A-Za-z0-9_-]{32,}`)
 
 // maskConnectionName mirrors upstream maskName: long token-like names are truncated.
 func maskConnectionName(name string) string {
-	if len(name) > 16 && longTokenPattern.MatchString(name) {
-		return name[:8] + "***"
+	if handlerutil.RuneCount(name) > 16 && longTokenPattern.MatchString(name) {
+		return handlerutil.RunePrefix(name, 8) + "***"
 	}
 	return name
 }
@@ -253,10 +253,10 @@ func maskConnectionName(name string) string {
 // file, never enough to replay it. Same shape as maskClientKey, which the
 // dashboard already uses for client API keys.
 func maskConnectionSecret(secret string) string {
-	if len(secret) <= 12 {
+	if handlerutil.RuneCount(secret) <= 12 {
 		return "***"
 	}
-	return secret[:6] + "…" + secret[len(secret)-4:]
+	return handlerutil.RunePrefix(secret, 6) + "…" + handlerutil.RuneSuffix(secret, 4)
 }
 
 // connectionSecretHint returns the credential a connection actually
@@ -864,6 +864,12 @@ func (h *DashboardHandler) writeConnectionModels(w http.ResponseWriter, r *http.
 	if conn.Data != "" {
 		_ = json.Unmarshal([]byte(conn.Data), &connData)
 	}
+	// The Zed catalogue branch reads the same fields through a named type.
+	zedData := &zedConnectionData{
+		APIKey:               connData.APIKey,
+		AccessToken:          connData.AccessToken,
+		ProviderSpecificData: connData.ProviderSpecificData,
+	}
 
 	type modelItem struct {
 		ID           string          `json:"id"`
@@ -890,11 +896,12 @@ func (h *DashboardHandler) writeConnectionModels(w http.ResponseWriter, r *http.
 		headers := map[string]string{
 			"Content-Type":  "application/json",
 			"Authorization": "Bearer " + token,
-			"User-Agent":    "antigravity/ide/2.11.0 darwin/arm64",
+			"User-Agent":    providers.AntigravityCLIUserAgent,
 		}
 		status, body, err := validateProbeDo(r.Context(), http.MethodPost, "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels", headers, reqPayload)
 		if err != nil {
-			handlerutil.WriteJSONError(w, http.StatusBadGateway, "failed to fetch antigravity models: "+err.Error())
+			statusCode, _, errMsg := ClassifyUpstreamNetworkError(err)
+			handlerutil.WriteJSONError(w, statusCode, "failed to fetch antigravity models: "+errMsg)
 			return
 		}
 		if status != http.StatusOK {
@@ -964,7 +971,8 @@ func (h *DashboardHandler) writeConnectionModels(w http.ResponseWriter, r *http.
 		}
 		status, body, err := validateProbeDo(r.Context(), http.MethodPost, "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels", headers, reqPayload)
 		if err != nil {
-			handlerutil.WriteJSONError(w, http.StatusBadGateway, "failed to fetch gemini-cli models: "+err.Error())
+			statusCode, _, errMsg := ClassifyUpstreamNetworkError(err)
+			handlerutil.WriteJSONError(w, statusCode, "failed to fetch gemini-cli models: "+errMsg)
 			return
 		}
 		if status != http.StatusOK {
@@ -1031,7 +1039,8 @@ func (h *DashboardHandler) writeConnectionModels(w http.ResponseWriter, r *http.
 		}
 		status, body, err := validateProbeDo(r.Context(), http.MethodGet, "https://api.cline.bot/api/v1/models", headers, nil)
 		if err != nil {
-			handlerutil.WriteJSONError(w, http.StatusBadGateway, "failed to fetch cline models: "+err.Error())
+			statusCode, _, errMsg := ClassifyUpstreamNetworkError(err)
+			handlerutil.WriteJSONError(w, statusCode, "failed to fetch cline models: "+errMsg)
 			return
 		}
 		if status != http.StatusOK {
@@ -1080,6 +1089,23 @@ func (h *DashboardHandler) writeConnectionModels(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// Zed's catalogue is behind a two-layer auth: the account token is traded
+	// for a short-lived LLM token first, so it needs its own branch rather
+	// than the plain bearer /models fetch.
+	if conn.Provider == "zed" {
+		zedModels, err := fetchZedCatalogModels(r.Context(), conn, zedData)
+		if err != nil {
+			handlerutil.WriteJSONError(w, http.StatusBadGateway, "failed to fetch Zed models: "+err.Error())
+			return
+		}
+		handlerutil.WriteJSON(w, http.StatusOK, map[string]any{
+			"provider":     conn.Provider,
+			"connectionId": conn.ID,
+			"models":       zedModels,
+		})
+		return
+	}
+
 	// OpenAI-compatible aggregators with a live /v1/models catalogue. The
 	// connection's key is the only credential these need.
 	if listURL := providers.ModelsListURL(conn.Provider); listURL != "" {
@@ -1097,7 +1123,8 @@ func (h *DashboardHandler) writeConnectionModels(w http.ResponseWriter, r *http.
 		}
 		status, body, err := validateProbeDo(r.Context(), http.MethodGet, listURL, headers, nil)
 		if err != nil {
-			handlerutil.WriteJSONError(w, http.StatusBadGateway, "failed to fetch models: "+err.Error())
+			statusCode, _, errMsg := ClassifyUpstreamNetworkError(err)
+			handlerutil.WriteJSONError(w, statusCode, "failed to fetch models: "+errMsg)
 			return
 		}
 		if status != http.StatusOK {
@@ -1112,6 +1139,14 @@ func (h *DashboardHandler) writeConnectionModels(w http.ResponseWriter, r *http.
 		items := listResp.Data
 		if len(items) == 0 {
 			items = listResp.Models
+		}
+		if conn.Provider == "nous" {
+			handlerutil.WriteJSON(w, http.StatusOK, map[string]any{
+				"provider":     conn.Provider,
+				"connectionId": conn.ID,
+				"models":       providers.NormalizeRoutedNousModels(items),
+			})
+			return
 		}
 		handlerutil.WriteJSON(w, http.StatusOK, map[string]any{
 			"provider":     conn.Provider,
@@ -1154,7 +1189,8 @@ func (h *DashboardHandler) writeConnectionModels(w http.ResponseWriter, r *http.
 	}
 	status, body, err := validateProbeDo(r.Context(), http.MethodGet, baseURL+"/models", headers, nil)
 	if err != nil {
-		handlerutil.WriteJSONError(w, http.StatusBadGateway, validateNodeNetworkMessage(err))
+		statusCode, _, errMsg := ClassifyUpstreamNetworkError(err)
+		handlerutil.WriteJSONError(w, statusCode, "failed to fetch models: "+errMsg)
 		return
 	}
 	if status != http.StatusOK {

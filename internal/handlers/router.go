@@ -98,6 +98,7 @@ func SetupRoutes(r interface {
 	r.Get("/videos/{id}", mediaH.HandleVideoGet)
 	r.Post("/search", mediaH.HandleSearch)
 	r.Post("/scrape", mediaH.HandleScrape)
+	r.Post("/web/fetch", mediaH.HandleWebFetch)
 	r.Post("/systemone", mediaH.HandleSystemone)
 
 	// The relay-deploy endpoints live in the dashboard group below, mounted
@@ -142,6 +143,9 @@ func SetupRoutes(r interface {
 	r.Get("/api/usage/stream", HandleUsageStream(repo))
 	r.Get("/usage/stats", HandleUsageStats(repo))
 	r.Get("/api/usage/stats", HandleUsageStats(repo))
+	r.Get("/usage/chart", HandleUsageChart(repo))
+	r.Get("/api/usage/chart", HandleUsageChart(repo))
+	r.Get("/api/usage/dashboard", HandleUsageDashboard(repo))
 	r.Get("/api/usage/request-details", HandleRequestDetails(repo))
 	r.Get("/api/usage/request-details/{id}", HandleRequestDetail(repo))
 	r.Get("/api/usage/providers", dashH.HandleGetUsageProviders)
@@ -166,6 +170,10 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	dashH := dashboard.NewDashboardHandler(repo, ts)
 	if chatH != nil {
 		dashH.SemanticCache = chatH.SemanticCache
+		// The engine's handler holds the limiter the data plane meters provider
+		// windows with, so the dashboard reports the same numbers the gate
+		// enforces instead of its own private view of them.
+		dashH.Limiter = chatH.RateLimiter
 	}
 	ssoH := sso.NewHandler(repo)
 
@@ -174,6 +182,11 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	r.Get("/api/providers/client", dashH.HandleGetProvidersClient)
 	r.Post("/api/connections", dashH.HandleCreateConnection)
 	r.Post("/api/providers/validate", dashH.HandleValidateProvider)
+	r.Post("/api/providers/gemini-web/browser-login", dashH.HandleGeminiWebBrowserLogin)
+	r.Post("/api/providers/gemini-web/import-chrome", dashH.HandleGeminiWebImportChrome)
+	r.Post("/api/providers/deepseek-web/browser-login", dashH.HandleDeepSeekWebBrowserLogin)
+	r.Post("/api/providers/deepseek-web/import-chrome", dashH.HandleDeepSeekWebImportChrome)
+	r.Post("/api/connections/{id}/renew-deepseek", dashH.HandleDeepSeekWebRenew)
 	r.Put("/api/connections/{id}", dashH.HandleUpdateConnection)
 	r.Put("/api/providers/{id}", dashH.HandleUpdateConnection)
 	r.Delete("/api/connections/{id}", dashH.HandleDeleteConnection)
@@ -192,6 +205,8 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	r.Get("/usage/stream", HandleUsageStream(repo))
 	r.Get("/api/usage/stats", HandleUsageStats(repo))
 	r.Get("/usage/stats", HandleUsageStats(repo))
+	r.Get("/api/usage/chart", HandleUsageChart(repo))
+	r.Get("/api/usage/dashboard", HandleUsageDashboard(repo))
 	r.Get("/api/usage/request-details", HandleRequestDetails(repo))
 	r.Get("/api/usage/request-details/{id}", HandleRequestDetail(repo))
 	r.Get("/api/usage/providers", dashH.HandleGetUsageProviders)
@@ -221,7 +236,16 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	r.Put("/api/provider-nodes/{id}", dashH.HandleUpdateProviderNode)
 	r.Delete("/api/provider-nodes/{id}", dashH.HandleDeleteProviderNode)
 	r.Post("/api/provider-nodes/validate", dashH.HandleValidateProviderNode)
+	// Per-node capacity limits (docs/provider-limits-plan.md). These live here as
+	// well as in dashboard.RegisterRoutes because that table is mounted by tests
+	// only: a route added there alone is reachable in a unit test and 404s on the
+	// real server, which is how this pair was nearly shipped.
+	r.Put("/api/provider-nodes/{id}/limits", dashH.HandleUpdateProviderNodeLimits)
+	r.Post("/api/provider-nodes/{id}/quota/reset", dashH.HandleResetProviderNodeQuota)
 	r.Get("/api/providers/{id}/models", dashH.HandleGetConnectionModels)
+	// Bulk removal of a node's imported models; the single-row form stays at
+	// DELETE /api/models/custom/{key}.
+	r.Delete("/api/providers/{id}/models", dashH.HandleDeleteProviderModels)
 	r.Get("/api/providers/{id}/overrides", dashH.HandleGetProviderOverrides)
 	r.Put("/api/providers/{id}/overrides", dashH.HandleSaveProviderOverrides)
 
@@ -229,7 +253,17 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	r.Post("/api/combos", dashH.HandleCreateCombo)
 	r.Post("/api/combos/auto-free", dashH.HandleAutoFreeCombo)
 	r.Post("/api/combos/auto-family", dashH.HandleAutoFamilyCombos)
+	r.Get("/api/combos/presets", dashH.HandleGetComboPresets)
+	r.Post("/api/combos/presets", dashH.HandleCreateComboPresets)
 	r.Put("/api/combos/{id}", dashH.HandleUpdateCombo)
+	// Smart select combo: dry-run a rule list, and apply every combo's rules on
+	// demand. These live here as well as in dashboard.RegisterRoutes for the
+	// same reason the node-limit pair does — that table is mounted by tests
+	// only, so a route registered there alone answers 200 in a unit test and
+	// "404 page not found" on the real server, which is exactly how the
+	// smart-rules editor shipped.
+	r.Post("/api/combos/reconcile", dashH.HandleReconcileSmartCombos)
+	r.Post("/api/combos/{id}/smart/preview", dashH.HandleComboSmartPreview)
 	r.Delete("/api/combos/{id}", dashH.HandleDeleteCombo)
 
 	r.Get("/api/proxy-pools", dashH.HandleGetProxyPools)
@@ -253,9 +287,16 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	r.Delete("/api/keys/{id}", dashH.HandleDeleteApiKey)
 	r.Put("/api/keys/{id}/toggle", dashH.HandleToggleApiKey)
 	r.Post("/api/keys/{id}/rotate", dashH.HandleRotateApiKey)
+	r.Post("/api/keys/{id}/reset-quota", dashH.HandleResetApiKeyQuota)
 	r.Get("/api/keys/{id}/models", dashH.HandleGetApiKeyModels)
 	r.Put("/api/keys/{id}/models", dashH.HandleSetApiKeyModels)
 	r.Put("/api/keys/{id}", dashH.HandleUpdateApiKey)
+	r.Get("/api/plans", dashH.HandleListPlans)
+	r.Post("/api/plans", dashH.HandleCreatePlan)
+	r.Get("/api/plans/{id}", dashH.HandleGetPlan)
+	r.Put("/api/plans/{id}", dashH.HandleUpdatePlan)
+	r.Delete("/api/plans/{id}", dashH.HandleDeletePlan)
+	r.Get("/api/plans/{id}/keys", dashH.HandlePlanKeys)
 	r.Get("/api/metrics", observ.Handler().ServeHTTP)
 	r.Get("/api/vault/status", dashH.HandleGetVaultStatus)
 	r.Get("/api/guardrails/policies", dashH.HandleGetGuardrailPolicies)
@@ -297,8 +338,13 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	r.Post("/api/settings/database", dashH.HandleImportDatabase)
 	r.Get("/api/settings/database/stats", dashH.HandleGetDatabaseStats)
 	r.Post("/api/settings/database/prune", dashH.HandlePruneDatabase)
+	r.Post("/api/settings/database/prune-usage", dashH.HandlePruneUsageHistory)
 	r.Post("/api/settings/database/vacuum", dashH.HandleVacuumDatabase)
 	r.Post("/api/settings/proxy-test", dashH.HandleProxyTest)
+
+	// Currency rates (profile page): reads live USD rates for the catalog codes
+	// and stores the subset the display uses.
+	r.Post("/api/settings/currency/refresh", dashH.HandleRefreshCurrencyRates)
 
 	// Token saver testing benches & filter catalog
 	r.Get("/api/tokensaver/rtk/filters", dashH.HandleGetRTKFilters)
@@ -399,7 +445,14 @@ func mountOAuthRoutes(r interface {
 
 // SetupServerRouter mounts public endpoints (/health, /api/hello) and
 // API-key protected routes (all engine + admin routes) on the chi router.
-func SetupServerRouter(r chi.Router, repo *db.Repo, ts *TokenSaverConfig) {
+//
+// It returns the engine's chat handler: the one SetupRoutes built and the
+// dashboard group is mounted on. The auto-ping scheduler sends its pings
+// through that same instance, so a ping resolves credentials, refreshes OAuth
+// and picks an executor the way real traffic does. Returning it is what keeps
+// the gateway from building a second handler for the scheduler — see the
+// warning on SetupRoutes about the two PersistentStores.
+func SetupServerRouter(r chi.Router, repo *db.Repo, ts *TokenSaverConfig) *chat.ChatHandler {
 	// Public (unauthenticated) endpoints
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
@@ -511,6 +564,9 @@ func SetupServerRouter(r chi.Router, repo *db.Repo, ts *TokenSaverConfig) {
 	// sized against it, so changing it has to restart the gateway.
 	window := time.Duration(repo.GetRateLimitDefaults().WindowSeconds) * time.Second
 	rateLimiter := middleware.NewRateLimiter(window)
+	// The plan tier (F-3) is resolved from the repository, so a plan change
+	// applies to the next request without a restart.
+	rateLimiter.SetPlanSource(repo)
 	// The fallback itself is read per request, so an operator can raise or drop
 	// a global default without a restart. Only the window, which the live
 	// windows already depend on, is pinned at boot.
@@ -529,10 +585,16 @@ func SetupServerRouter(r chi.Router, repo *db.Repo, ts *TokenSaverConfig) {
 	var engineChatH *chat.ChatHandler
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.RequireApiKey(repo))
-		r.Use(middleware.RequireRateLimit(rateLimiter, defaults))
+		r.Use(middleware.RequireRateLimit(rateLimiter, defaults, repo))
 		r.Use(guardrails.Inbound(guardrailStore, guardrailAudit(repo), guardrailSwitch))
 		engineChatH = SetupRoutes(r, repo, ts)
 	})
+
+	// The provider gate (docs/provider-limits-plan.md) reads the same limiter
+	// for its per-node buckets, which the per-key middleware never touches.
+	// Without this call the gate is inert on a real boot: its unit tests set
+	// the field by hand, so only a booted router can tell the difference.
+	engineChatH.SetRateLimiter(rateLimiter)
 
 	// Dashboard management API: login-gated when requireLogin is on, but still
 	// reachable with a valid API key or the local CLI token (upstream parity).
@@ -562,4 +624,5 @@ func SetupServerRouter(r chi.Router, repo *db.Repo, ts *TokenSaverConfig) {
 	})
 
 	SetupConsoleLogRoutes(r, repo)
+	return engineChatH
 }

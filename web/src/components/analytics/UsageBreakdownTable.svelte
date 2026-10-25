@@ -42,7 +42,7 @@
       return
     }
     sortKey = key
-    // Text columns read best AÔåÆZ first; every numeric/timestamp column is more
+    // Text columns read best A→Z first; every numeric/timestamp column is more
     // useful biggest/newest first, which is also the unsorted default.
     sortDir = key === 'name' || key === 'provider' ? 'asc' : 'desc'
   }
@@ -134,8 +134,8 @@
   // A header is a button: the arrow marks the active column and its direction,
   // and an inactive column shows a dimmed pair so the affordance is visible.
   function arrow(key: SortKey): string {
-    if (sortKey !== key) return 'Ôåò'
-    return sortDir === 'asc' ? 'Ôåæ' : 'Ôåô'
+    if (sortKey !== key) return '↕'
+    return sortDir === 'asc' ? '↑' : '↓'
   }
 
   function headerClass(key: SortKey, align: 'left' | 'right' = 'left'): string {

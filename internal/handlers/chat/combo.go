@@ -16,6 +16,7 @@ import (
 	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/log"
 	"9router/proxy/internal/providers"
+	internalproxy "9router/proxy/internal/proxy"
 	"9router/proxy/internal/translator"
 )
 
@@ -493,6 +494,31 @@ func keysString(m map[string]bool) string {
 	return strings.Join(slices.Sorted(maps.Keys(m)), ",")
 }
 
+// upstreamErrorBody renders the terminal error a combo answers with when no
+// member could serve the turn.
+//
+// The message is encoded by json.Marshal, never interpolated into a template:
+// an upstream failure routinely carries characters that are illegal raw inside
+// a JSON string — a URL that failed to parse embeds itself in quotes, a Windows
+// path carries backslashes — and a format string emits them verbatim. The
+// result is a body no client can parse: the first quote in the error text
+// closes the string early and the following backslash becomes a bare token,
+// which is what a JavaScript client reports as
+// `JSON Parse error: Unrecognized token '\'`.
+func upstreamErrorBody(message string) []byte {
+	body, err := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": message,
+			"type":    "upstream_error",
+			"code":    http.StatusBadGateway,
+		},
+	})
+	if err != nil {
+		return []byte(`{"error":{"message":"upstream error","type":"upstream_error","code":502}}`)
+	}
+	return body
+}
+
 // handleComboFallback iterates through combo model entries, trying each one.
 // Auto-capability-switch: floats vision/pdf-capable models to the front.
 // adapterModels holds the capacity-adapter entries injected for this request;
@@ -539,11 +565,12 @@ func (h *ChatHandler) handleComboFallback(ctx context.Context, w http.ResponseWr
 			excludeIDs = nil
 		}
 
-		for _, entry := range models {
+		for i, entry := range models {
 			modelInfo := h.resolveModelEntry(entry)
 			if modelInfo == nil {
 				continue
 			}
+			isLastModel := i == len(models)-1
 
 			// Skip unavailable (model-locked) providers
 			if !h.Repo.IsProviderAvailable(modelInfo.Provider, modelInfo.Model) {
@@ -572,6 +599,20 @@ func (h *ChatHandler) handleComboFallback(ctx context.Context, w http.ResponseWr
 					var err error
 					picked, cData, err = h.getBestConnectionWithContext(ctx, modelInfo.Provider, modelInfo.ConnectionID, excludeIDs, modelInfo.Model)
 					if err != nil {
+						// A node the gateway refuses on purpose — expired contract,
+						// spent lifetime quota — must reach the client as that
+						// refusal rather than as an anonymous "all combo models
+						// failed": an operator can act on the first and not on the
+						// second.
+						if refusal, blocked := providerLimitRefusal(err); blocked {
+							log.Info("combo", "provider node unusable, next candidate",
+								"provider", modelInfo.Provider, "model", modelInfo.Model, "axis", refusal.Axis)
+							var refusedErr *upstreamError
+							errors.As(err, &refusedErr)
+							if refusedErr != nil {
+								lastErr = refusedErr
+							}
+						}
 						break
 					}
 					connID = picked.ID
@@ -606,12 +647,16 @@ func (h *ChatHandler) handleComboFallback(ctx context.Context, w http.ResponseWr
 				}
 
 				var fwdErr error
+				fwdCtx := ctx
+				if !isStream {
+					fwdCtx = internalproxy.WithZeroContentProbe(ctx, !isLastModel)
+				}
 				if modelInfo.Provider == "mimo-free" {
 					comboMetrics := &streamMetrics{}
-					fwdErr = h.MimoFreeChat(ctx, cw, upstreamJSON, isStream, comboMetrics)
+					fwdErr = h.MimoFreeChat(fwdCtx, cw, upstreamJSON, isStream, comboMetrics)
 				} else {
 					fwdErr = h.tryForwardWithConnection(forwardRequestParams{
-						Ctx: ctx, W: cw, Provider: modelInfo.Provider, Model: modelInfo.Model,
+						Ctx: fwdCtx, W: cw, Provider: modelInfo.Provider, Model: modelInfo.Model,
 						RequestedModel: comboName, ComboName: comboName,
 						ConnectionID: connID, ConnName: connObjName(picked), ConnEmail: connObjEmail(picked),
 						ConnData: connData, Body: upstreamJSON,
@@ -621,8 +666,14 @@ func (h *ChatHandler) handleComboFallback(ctx context.Context, w http.ResponseWr
 				}
 
 				if fwdErr != nil {
+					var zcErr *internalproxy.ZeroContentError
+					if errors.As(fwdErr, &zcErr) {
+						log.Warn("combo", "zero usable content, falling back to next model", "provider", modelInfo.Provider, "model", modelInfo.Model)
+						lastErr = &upstreamError{StatusCode: http.StatusOK, Body: zcErr.Body}
+						break
+					}
 					if ctx.Err() != nil {
-						lastErr = &upstreamError{StatusCode: StatusClientClosedRequest, Body: []byte(`{"error":{"message":"client closed request","type":"client_closed_request","code":499}}`)}
+						lastErr = &upstreamError{StatusCode: StatusClientClosedRequest, Body: []byte(clientClosedBody)}
 						break
 					}
 					if isGuardrailBlock(fwdErr) {
@@ -635,6 +686,25 @@ func (h *ChatHandler) handleComboFallback(ctx context.Context, w http.ResponseWr
 						errors.As(fwdErr, &ue)
 						lastErr = ue
 						break
+					}
+					if attempt, refused := providerLimitRefusal(fwdErr); refused {
+						// A provider at its own capacity is neither an account
+						// fault nor a bad model: cooling the connection down
+						// would park a healthy account, and the next candidate
+						// may be free. Keep the refusal as the terminal error for
+						// when none is left.
+						log.Info("combo", "provider limit, next candidate",
+							"provider", modelInfo.Provider, "model", modelInfo.Model,
+							"axis", attempt.Axis, "conn", connID)
+						var refusedErr *upstreamError
+						errors.As(fwdErr, &refusedErr)
+						if refusedErr != nil {
+							lastErr = refusedErr
+						}
+						if isKnownNoAuth {
+							break
+						}
+						continue
 					}
 					var ue *upstreamError
 					if errors.As(fwdErr, &ue) {
@@ -655,6 +725,20 @@ func (h *ChatHandler) handleComboFallback(ctx context.Context, w http.ResponseWr
 							lastErr = ue
 							break
 						}
+						// A prompt that does not fit this model fails the same
+						// way on every connection to it, so advancing to the
+						// next combo member is the only move that can succeed
+						// (#338). Breaking here also skips
+						// comboLockRetryable: the account is fine, and cooling
+						// it down would take a healthy connection out of the
+						// rotation.
+						if providers.IsModelFitError(ue.StatusCode, ue.Body) {
+							log.Info("combo", "model too small for request, next member",
+								"provider", modelInfo.Provider, "model", modelInfo.Model)
+							retry.note(ue)
+							lastErr = ue
+							break
+						}
 						if providers.RetryableStatusCodes[ue.StatusCode] {
 							h.comboLockRetryable(ctx, &excludeIDs, connID, modelInfo.Provider, modelInfo.Model, ue)
 						}
@@ -669,7 +753,7 @@ func (h *ChatHandler) handleComboFallback(ctx context.Context, w http.ResponseWr
 						}
 						continue
 					}
-					lastErr = &upstreamError{StatusCode: http.StatusBadGateway, Body: []byte(fmt.Sprintf(`{"error":{"message":"upstream error: %v","type":"upstream_error","code":502}}`, fwdErr))}
+					lastErr = &upstreamError{StatusCode: http.StatusBadGateway, Body: upstreamErrorBody(fmt.Sprintf("upstream error: %v", fwdErr))}
 					if isKnownNoAuth {
 						break
 					}
@@ -756,11 +840,12 @@ func (h *ChatHandler) handleMessagesComboFallback(ctx context.Context, w http.Re
 			excludeIDs = nil
 		}
 
-		for _, entry := range models {
+		for i, entry := range models {
 			modelInfo := h.resolveModelEntry(entry)
 			if modelInfo == nil {
 				continue
 			}
+			isLastModel := i == len(models)-1
 
 			// Skip unavailable (model-locked) providers
 			if !h.Repo.IsProviderAvailable(modelInfo.Provider, modelInfo.Model) {
@@ -789,6 +874,15 @@ func (h *ChatHandler) handleMessagesComboFallback(ctx context.Context, w http.Re
 					var err error
 					picked, cData, err = h.getBestConnectionWithContext(ctx, modelInfo.Provider, modelInfo.ConnectionID, excludeIDs, modelInfo.Model)
 					if err != nil {
+						if refusal, blocked := providerLimitRefusal(err); blocked {
+							log.Info("combo", "provider node unusable, next candidate",
+								"provider", modelInfo.Provider, "model", modelInfo.Model, "axis", refusal.Axis)
+							var refusedErr *upstreamError
+							errors.As(err, &refusedErr)
+							if refusedErr != nil {
+								lastErr = refusedErr
+							}
+						}
 						break
 					}
 					connID = picked.ID
@@ -819,8 +913,12 @@ func (h *ChatHandler) handleMessagesComboFallback(ctx context.Context, w http.Re
 					break
 				}
 
+				fwdCtx := ctx
+				if !isStream {
+					fwdCtx = internalproxy.WithZeroContentProbe(ctx, !isLastModel)
+				}
 				fwdErr := h.tryForwardWithConnection(forwardRequestParams{
-					Ctx: ctx, W: cw, Provider: modelInfo.Provider, Model: modelInfo.Model,
+					Ctx: fwdCtx, W: cw, Provider: modelInfo.Provider, Model: modelInfo.Model,
 					RequestedModel: comboName, ComboName: comboName,
 					ConnectionID: connID, ConnName: connObjName(picked), ConnEmail: connObjEmail(picked),
 					ConnData: connData, Body: upstreamJSON,
@@ -829,8 +927,14 @@ func (h *ChatHandler) handleMessagesComboFallback(ctx context.Context, w http.Re
 				})
 
 				if fwdErr != nil {
+					var zcErr *internalproxy.ZeroContentError
+					if errors.As(fwdErr, &zcErr) {
+						log.Warn("combo", "zero usable content, falling back to next model", "provider", modelInfo.Provider, "model", modelInfo.Model)
+						lastErr = &upstreamError{StatusCode: http.StatusOK, Body: zcErr.Body}
+						break
+					}
 					if ctx.Err() != nil {
-						lastErr = &upstreamError{StatusCode: StatusClientClosedRequest, Body: []byte(`{"error":{"message":"client closed request","type":"client_closed_request","code":499}}`)}
+						lastErr = &upstreamError{StatusCode: StatusClientClosedRequest, Body: []byte(clientClosedBody)}
 						break
 					}
 					if isGuardrailBlock(fwdErr) {
@@ -842,6 +946,23 @@ func (h *ChatHandler) handleMessagesComboFallback(ctx context.Context, w http.Re
 						lastErr = blocked
 						break
 					}
+					if attempt, refused := providerLimitRefusal(fwdErr); refused {
+						// Same contract as the OpenAI loop: the endpoint is busy,
+						// so the next candidate is tried without a cooldown on an
+						// account that did nothing wrong.
+						log.Info("combo", "provider limit, next candidate",
+							"provider", modelInfo.Provider, "model", modelInfo.Model,
+							"axis", attempt.Axis, "conn", connID)
+						var refusedErr *upstreamError
+						errors.As(fwdErr, &refusedErr)
+						if refusedErr != nil {
+							lastErr = refusedErr
+						}
+						if isKnownNoAuth {
+							break
+						}
+						continue
+					}
 					var ue *upstreamError
 					if errors.As(fwdErr, &ue) {
 						// Same contract as the OpenAI loop: a 410 naming a dead
@@ -852,6 +973,20 @@ func (h *ChatHandler) handleMessagesComboFallback(ctx context.Context, w http.Re
 						// would have nothing left to fail over to.
 						if providers.IsModelDeprecation(ue.StatusCode, ue.Body) {
 							h.recordModelDeprecation(ctx, modelInfo.Provider, modelInfo.Model, connID, ue)
+							retry.note(ue)
+							lastErr = ue
+							break
+						}
+						// A prompt that does not fit this model fails the same
+						// way on every connection to it, so advancing to the
+						// next combo member is the only move that can succeed
+						// (#338). Breaking here also skips
+						// comboLockRetryable: the account is fine, and cooling
+						// it down would take a healthy connection out of the
+						// rotation.
+						if providers.IsModelFitError(ue.StatusCode, ue.Body) {
+							log.Info("combo", "model too small for request, next member",
+								"provider", modelInfo.Provider, "model", modelInfo.Model)
 							retry.note(ue)
 							lastErr = ue
 							break
@@ -870,7 +1005,7 @@ func (h *ChatHandler) handleMessagesComboFallback(ctx context.Context, w http.Re
 						}
 						continue
 					}
-					lastErr = &upstreamError{StatusCode: http.StatusBadGateway, Body: []byte(fmt.Sprintf(`{"error":{"message":"upstream error: %v","type":"upstream_error","code":502}}`, fwdErr))}
+					lastErr = &upstreamError{StatusCode: http.StatusBadGateway, Body: upstreamErrorBody(fmt.Sprintf("upstream error: %v", fwdErr))}
 					if isKnownNoAuth {
 						break
 					}
@@ -929,8 +1064,19 @@ func (h *ChatHandler) comboLockRetryable(ctx context.Context, excludeIDs *[]stri
 	if connID == "" {
 		return
 	}
+	// Same contract as the single-provider failover loop: an OpenCode free-tier
+	// refusal is an egress verdict, not an account or model fault. Cooling
+	// either would park a healthy account (and, for the 429 usage-limit shape,
+	// hide it behind a quota it does not own), so the connection is only
+	// excluded for the rest of this pass and the next combo entry is tried.
+	if isOpencodeFreeTierRefusal(provider, ue) {
+		*excludeIDs = append(*excludeIDs, connID)
+		log.Warn("combo", "opencode free-tier refusal, not locking the account",
+			"provider", provider, "model", model, "conn", connID, "status", ue.StatusCode)
+		return
+	}
 	currentLevel := h.Repo.GetConnectionBackoffLevel(connID)
-	cls := providers.ClassifyError(ue.StatusCode, extractErrorText(ue.Body), currentLevel)
+	cls := providers.ClassifyErrorForProvider(ue.StatusCode, extractErrorText(ue.Body), currentLevel, provider)
 	// Upstream parity (checkFallbackError): request-scoped 4xx (400/404/405/
 	// 409/422/...) must not lock the account — the bug is in the request,
 	// not the credential. Only lock when ShouldFallback is set.
@@ -949,7 +1095,7 @@ func (h *ChatHandler) comboLockRetryable(ctx context.Context, excludeIDs *[]stri
 	// can skip this account before spending a request (upstream applyErrorState).
 	// Only lock if error is account-scoped, not model-scoped (e.g. 401 auth issues),
 	// so unrelated models stay available.
-	if isModelScopedError(ue.StatusCode, extractErrorText(ue.Body), model) {
+	if isModelScopedError(ue.StatusCode, extractErrorText(ue.Body), model, ue.Body) {
 		if recErr := h.Repo.RecordConnectionScopedError(connID, model, "chat", ue.StatusCode, extractErrorText(ue.Body), cls.NewBackoffLevel); recErr != nil {
 			log.Warn("combo", "record connection error failed", "conn", connID, "error", recErr)
 		}

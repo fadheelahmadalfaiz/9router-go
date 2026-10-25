@@ -31,14 +31,15 @@ const (
 type Metrics struct {
 	reg *prometheus.Registry
 
-	RequestsTotal    *prometheus.CounterVec
-	RequestDuration  *prometheus.HistogramVec
-	TimeToFirstToken *prometheus.HistogramVec
-	TokensTotal      *prometheus.CounterVec
-	CostMicros       *prometheus.CounterVec
-	Fallbacks        *prometheus.CounterVec
-	UpstreamErrors   *prometheus.CounterVec
-	RateLimitRejects *prometheus.CounterVec
+	RequestsTotal      *prometheus.CounterVec
+	RequestDuration    *prometheus.HistogramVec
+	TimeToFirstToken   *prometheus.HistogramVec
+	TokensTotal        *prometheus.CounterVec
+	CostMicros         *prometheus.CounterVec
+	Fallbacks          *prometheus.CounterVec
+	UpstreamErrors     *prometheus.CounterVec
+	RateLimitRejects   *prometheus.CounterVec
+	RateLimitQueue     *prometheus.HistogramVec
 	GuardrailDecisions *prometheus.CounterVec
 	GuardrailEval      *prometheus.HistogramVec
 }
@@ -49,6 +50,10 @@ type Metrics struct {
 var (
 	latencyBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120}
 	ttftBuckets    = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 30}
+	// queueBuckets cover a concurrency wait from an instant to a couple of
+	// minutes. The default queue timeout is 60s, so the buckets straddle it and
+	// an operator can see how close the fleet runs to the ceiling.
+	queueBuckets = []float64{0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120}
 )
 
 // New builds a Metrics with a private registry. Registration into a registry
@@ -92,6 +97,11 @@ func New() *Metrics {
 			Name: "router_rate_limit_rejects_total",
 			Help: "Requests rejected by a rate limiter before reaching an upstream, by limiter scope.",
 		}, []string{"scope", "key"}),
+		RateLimitQueue: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "router_rate_limit_queue_seconds",
+			Help:    "Time a request spent waiting for a free per-key concurrency slot.",
+			Buckets: queueBuckets,
+		}, []string{"scope"}),
 		GuardrailDecisions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "router_guardrail_decisions_total",
 			Help: "Guardrail decisions by detector, action and direction.",
@@ -105,7 +115,7 @@ func New() *Metrics {
 	reg.MustRegister(
 		m.RequestsTotal, m.RequestDuration, m.TimeToFirstToken,
 		m.TokensTotal, m.CostMicros, m.Fallbacks, m.UpstreamErrors,
-		m.RateLimitRejects, m.GuardrailDecisions, m.GuardrailEval,
+		m.RateLimitRejects, m.RateLimitQueue, m.GuardrailDecisions, m.GuardrailEval,
 	)
 	return m
 }
@@ -210,6 +220,34 @@ func IncRateLimitReject(scope, keyID string) {
 
 func (m *Metrics) IncRateLimitReject(scope, keyID string) {
 	m.RateLimitRejects.WithLabelValues(Label(scope), KeyRef(keyID)).Inc()
+}
+
+// ObserveRateLimitQueueWait records how long a request waited for a free slot in
+// the per-key limiter. It is the package-level convenience over the default
+// registry; the per-registry form is below.
+func ObserveRateLimitQueueWait(seconds float64) {
+	Default().ObserveRateLimitQueueWait(seconds)
+}
+
+// ObserveRateLimitQueueWait records how long a request waited for a free slot in
+// the per-key limiter, on this registry.
+func (m *Metrics) ObserveRateLimitQueueWait(seconds float64) {
+	m.ObserveRateLimitQueueWaitFor("api_key", seconds)
+}
+
+// ObserveRateLimitQueueWaitFor records a wait in the named limiter scope
+// ("api_key" for a caller's own limit, "provider" for a custom provider's
+// capacity). The scope is a parameter rather than a constant because the two
+// waits mean different things to whoever is reading the graph: a key waiting on
+// its own budget is the caller's problem, a provider waiting on its endpoint is
+// the operator's.
+func ObserveRateLimitQueueWaitFor(scope string, seconds float64) {
+	Default().ObserveRateLimitQueueWaitFor(scope, seconds)
+}
+
+// ObserveRateLimitQueueWaitFor is the per-registry implementation.
+func (m *Metrics) ObserveRateLimitQueueWaitFor(scope string, seconds float64) {
+	m.RateLimitQueue.WithLabelValues(Label(scope)).Observe(seconds)
 }
 
 // RecordGuardrailDecision counts one guardrail decision and observes how long

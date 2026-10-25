@@ -3,6 +3,7 @@ package handlers
 import (
 	"fmt"
 	"maps"
+	"strings"
 	"sync"
 	"time"
 
@@ -129,6 +130,7 @@ type rawMeta struct {
 	provider     string
 	connectionID string
 	apiKey       string
+	endpoint     string
 }
 
 // rawAggregate is the fold of one window's usageHistory rows.
@@ -144,11 +146,13 @@ type rawAggregate struct {
 	byModel    map[string]*rawTotals
 	byAccount  map[string]*rawTotals
 	byAPIKey   map[string]*rawTotals
+	byEndpoint map[string]*rawTotals
 
 	providerMeta map[string]rawMeta
 	modelMeta    map[string]rawMeta
 	accountMeta  map[string]rawMeta
 	apiKeyMeta   map[string]rawMeta
+	endpointMeta map[string]rawMeta
 }
 
 func newRawAggregate() *rawAggregate {
@@ -157,10 +161,12 @@ func newRawAggregate() *rawAggregate {
 		byModel:      map[string]*rawTotals{},
 		byAccount:    map[string]*rawTotals{},
 		byAPIKey:     map[string]*rawTotals{},
+		byEndpoint:   map[string]*rawTotals{},
 		providerMeta: map[string]rawMeta{},
 		modelMeta:    map[string]rawMeta{},
 		accountMeta:  map[string]rawMeta{},
 		apiKeyMeta:   map[string]rawMeta{},
+		endpointMeta: map[string]rawMeta{},
 	}
 }
 
@@ -194,8 +200,7 @@ func apiKeyBucketKey(apiKey string) string {
 // would drift the cost total in its last digits — a parity break users would
 // read as a billing error.
 func (a *rawAggregate) foldRow(row db.UsageHistoryRow) {
-	promptTok := int64(row.PromptTokens)
-	complTok := int64(row.CompletionTokens)
+	promptTok, complTok := translator.ResolveTokensCounts([]byte(row.Tokens), row.PromptTokens, row.CompletionTokens)
 	cachedTok := int64(translator.CachedTokensFromJSON([]byte(row.Tokens)))
 
 	if row.Provider != "" {
@@ -228,6 +233,16 @@ func (a *rawAggregate) foldRow(row db.UsageHistoryRow) {
 		provider: row.Provider,
 		apiKey:   apiKeyBucketKey(row.APIKey),
 	}
+
+	if row.Endpoint != "" {
+		epKey := row.Endpoint + "|" + row.Model + "|" + row.Provider
+		bucket(a.byEndpoint, epKey).add(row, promptTok, complTok, cachedTok)
+		a.endpointMeta[epKey] = rawMeta{
+			endpoint: row.Endpoint,
+			rawModel: row.Model,
+			provider: row.Provider,
+		}
+	}
 }
 
 // unfoldRow removes one row's contribution, for a row that aged out of a sliding
@@ -237,8 +252,7 @@ func (a *rawAggregate) foldRow(row db.UsageHistoryRow) {
 // the order they were added, which keeps the float sum from drifting further
 // than the fold did.
 func (a *rawAggregate) unfoldRow(row db.UsageHistoryRow) {
-	promptTok := int64(row.PromptTokens)
-	complTok := int64(row.CompletionTokens)
+	promptTok, complTok := translator.ResolveTokensCounts([]byte(row.Tokens), row.PromptTokens, row.CompletionTokens)
 	cachedTok := int64(translator.CachedTokensFromJSON([]byte(row.Tokens)))
 
 	if row.Provider != "" {
@@ -287,6 +301,18 @@ func (a *rawAggregate) unfoldRow(row db.UsageHistoryRow) {
 	if t.requests <= 0 {
 		delete(a.byAPIKey, keyKey)
 		delete(a.apiKeyMeta, keyKey)
+	}
+
+	if row.Endpoint != "" {
+		epKey := row.Endpoint + "|" + row.Model + "|" + row.Provider
+		t = bucket(a.byEndpoint, epKey)
+		subtractFrom(t, row, promptTok, complTok, cachedTok)
+		if t.requests <= 0 {
+			delete(a.byEndpoint, epKey)
+			delete(a.endpointMeta, epKey)
+		} else if t.lastUsed == row.Timestamp {
+			t.lastUsed = ""
+		}
 	}
 }
 
@@ -479,10 +505,12 @@ func snapshotOf(a *rawAggregate) *rawAggregate {
 		byModel:      copyBuckets(a.byModel),
 		byAccount:    copyBuckets(a.byAccount),
 		byAPIKey:     copyBuckets(a.byAPIKey),
+		byEndpoint:   copyBuckets(a.byEndpoint),
 		providerMeta: maps.Clone(a.providerMeta),
 		modelMeta:    maps.Clone(a.modelMeta),
 		accountMeta:  maps.Clone(a.accountMeta),
 		apiKeyMeta:   maps.Clone(a.apiKeyMeta),
+		endpointMeta: maps.Clone(a.endpointMeta),
 	}
 	return clone
 }
@@ -530,13 +558,19 @@ func friendlyAccountName(connectionID string, connMap map[string]string) string 
 // indexes both the stored key and its mask, because the shared database holds
 // rows written by both this build and the Next.js dashboard.
 func apiKeyDisplayName(storedKey string, keyNames map[string]string) string {
+	trimmed := strings.TrimSpace(storedKey)
 	switch {
+	case keyNames[trimmed] != "":
+		return keyNames[trimmed]
 	case keyNames[storedKey] != "":
 		return keyNames[storedKey]
-	case storedKey == "local-no-key":
+	case trimmed == "local-no-key" || trimmed == "" || trimmed == "***":
 		return "Local (No Key)"
 	default:
-		return storedKey[:min(8, len(storedKey))] + "..."
+		if masked := maskAPIKeyForStats(trimmed); masked != "" {
+			return masked
+		}
+		return "Local (No Key)"
 	}
 }
 
@@ -550,6 +584,7 @@ func applyRawAggregate(resp *UsageStatsResponse, agg *rawAggregate, nodeNameMap,
 		p.CompletionTokens = t.completionTokens
 		p.CachedTokens = t.cachedTokens
 		p.Cost = t.cost
+		p.LastUsed = t.lastUsed
 		resp.ByProvider[key] = p
 	}
 
@@ -590,8 +625,12 @@ func applyRawAggregate(resp *UsageStatsResponse, agg *rawAggregate, nodeNameMap,
 		k := resp.ByApiKey[key]
 		k.RawModel = meta.rawModel
 		k.Provider = displayProviderName(meta.provider, nodeNameMap)
-		k.ApiKeyMasked = meta.apiKey
-		k.ApiKeyKey = meta.apiKey
+		masked := maskAPIKeyForStats(meta.apiKey)
+		if masked == "" {
+			masked = "local-no-key"
+		}
+		k.ApiKeyMasked = masked
+		k.ApiKeyKey = masked
 		k.KeyName = apiKeyDisplayName(meta.apiKey, keyNames)
 		k.Requests = t.requests
 		k.PromptTokens = t.promptTokens
@@ -600,5 +639,20 @@ func applyRawAggregate(resp *UsageStatsResponse, agg *rawAggregate, nodeNameMap,
 		k.Cost = t.cost
 		k.LastUsed = t.lastUsed
 		resp.ByApiKey[key] = k
+	}
+
+	for key, t := range agg.byEndpoint {
+		meta := agg.endpointMeta[key]
+		e := resp.ByEndpoint[key]
+		e.Endpoint = meta.endpoint
+		e.RawModel = meta.rawModel
+		e.Provider = displayProviderName(meta.provider, nodeNameMap)
+		e.Requests = t.requests
+		e.PromptTokens = t.promptTokens
+		e.CompletionTokens = t.completionTokens
+		e.CachedTokens = t.cachedTokens
+		e.Cost = t.cost
+		e.LastUsed = t.lastUsed
+		resp.ByEndpoint[key] = e
 	}
 }

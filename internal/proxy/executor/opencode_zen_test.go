@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"9router/proxy/internal/providers"
+	"9router/proxy/internal/proxy"
 	"9router/proxy/internal/translator"
 )
 
@@ -322,5 +323,214 @@ func TestNormalizeZenResponsesBody_ReasoningShapes(t *testing.T) {
 				t.Errorf("reasoning.summary = %v, want %v", rm["summary"], tt.wantSum)
 			}
 		})
+	}
+}
+
+// Paid ids stay on the keyed /zen/v1 lane with the v1 identity — including
+// big-pickle, which has no live 403 evidence and the lane table carries as
+// paid chat, so it must not be swept into the inference gate. The -free suffix
+// rule added for #327 must not reach a bare paid id like this one.
+func TestForwardOpencodeZen_KeyedLaneStaysOnZenV1(t *testing.T) {
+	tests := []struct {
+		model string
+		want  string
+		reply func(w http.ResponseWriter)
+	}{
+		{"big-pickle", "/zen/v1/chat/completions", zenChatReply},
+		{"deepseek-v4-pro", "/zen/v1/chat/completions", zenChatReply},
+		{"grok-4.6", "/zen/v1/responses", zenResponsesReply},
+	}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			var path, ua, client string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				path = r.URL.Path
+				ua = r.Header.Get("User-Agent")
+				client = r.Header.Get("x-opencode-client")
+				tt.reply(w)
+			}))
+			defer srv.Close()
+			rec := httptest.NewRecorder()
+			req := &Request{
+				Ctx:    context.Background(),
+				Client: srv.Client(),
+				Config: &providers.ProviderConfig{
+					BaseURL:    srv.URL + "/zen/v1/chat/completions",
+					AuthHeader: "Authorization",
+					AuthScheme: "bearer",
+					StaticHeaders: map[string]string{
+						"x-opencode-client": "desktop",
+						"User-Agent":        "opencode/1.18.31",
+					},
+				},
+				APIKey:        "sk-zen",
+				Body:          []byte(`{"model":"` + tt.model + `","messages":[{"role":"user","content":"hi"}],"stream":true}`),
+				IsStream:      true,
+				TranslateResp: false,
+			}
+			if err := ForwardOpencodeZen(rec, req); err != nil {
+				t.Fatalf("ForwardOpencodeZen: %v", err)
+			}
+			if path != tt.want {
+				t.Errorf("model %q reached %q, want the keyed lane %q", tt.model, path, tt.want)
+			}
+			if ua != proxy.DefaultOpenCodeV1UA {
+				t.Errorf("model %q sent User-Agent %q, want the v1 identity %q", tt.model, ua, proxy.DefaultOpenCodeV1UA)
+			}
+			if client != "desktop" {
+				t.Errorf("model %q sent x-opencode-client %q, want desktop", tt.model, client)
+			}
+		})
+	}
+}
+
+// Free-tier ids 403 on the keyed lane ("free tier can only be used from within
+// OpenCode", probed live), so they travel exactly like free-executor requests:
+// inference endpoint, Bearer public, v2 cli identity and fingerprint.
+// The shaper must follow the gate the request lands on, not the lane it arrived
+// from. A free id is forwarded to the keyless inference gate from every lane,
+// and that gate wants the genuine CLI 2.x read/shell definitions; the legacy
+// quartet is the /zen/v1 fingerprint and is refused there.
+//
+// This pins the rule directly rather than through a lane, because no free id is
+// served on the messages lane today — the bug this guards (the messages lane
+// shaping every request as paid) was therefore invisible to every lane test.
+func TestZenShapedBodyFollowsTheDestinationGate(t *testing.T) {
+	client := []byte(`{"model":"x","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"Bash","parameters":{"type":"object"}}}]}`)
+
+	t.Run("free id gets the CLI 2.x fingerprint", func(t *testing.T) {
+		out, _ := zenShapedBody(client, "deepseek-v4-flash-free", true)
+		var payload map[string]any
+		if err := json.Unmarshal(out, &payload); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		raw, _ := payload["tools"].([]any)
+		names := map[string]bool{}
+		for _, tool := range raw {
+			if m, ok := tool.(map[string]any); ok {
+				if fn, ok := m["function"].(map[string]any); ok {
+					if n, ok := fn["name"].(string); ok {
+						names[n] = true
+					}
+				}
+			}
+		}
+		if !names["read"] || !names["shell"] {
+			t.Errorf(`a free request must carry the genuine "read" and "shell" fingerprint, got %v`, names)
+		}
+		if names["bash"] || names["glob"] || names["grep"] {
+			t.Errorf("a free request must not receive the legacy quartet, got %v", names)
+		}
+	})
+
+	t.Run("paid id keeps the legacy quartet collapse", func(t *testing.T) {
+		out, nameMap := zenShapedBody(client, "deepseek-v4-pro", false)
+		if nameMap["bash"] != "Bash" {
+			t.Errorf("paid request must collapse Bash -> bash, got map %v", nameMap)
+		}
+		if !strings.Contains(string(out), `"name":"bash"`) {
+			t.Errorf("paid request must declare bash, got %s", out)
+		}
+	})
+}
+
+func TestForwardOpencodeZen_FreeModelTakesInferenceGate(t *testing.T) {
+	tests := []struct {
+		model string
+		want  string
+		reply func(w http.ResponseWriter)
+	}{
+		{"deepseek-v4-flash-free", "/inference/v1/chat/completions", zenChatReply},
+		{"muse-spark-1.3-contributor-free", "/inference/v1/responses", zenResponsesReply},
+	}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			var path, auth, ua, client string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				path = r.URL.Path
+				auth = r.Header.Get("Authorization")
+				ua = r.Header.Get("User-Agent")
+				client = r.Header.Get("x-opencode-client")
+				tt.reply(w)
+			}))
+			defer srv.Close()
+			rec := httptest.NewRecorder()
+			req := &Request{
+				Ctx:    context.Background(),
+				Client: srv.Client(),
+				Config: &providers.ProviderConfig{
+					BaseURL:    srv.URL + "/zen/v1/chat/completions",
+					AuthHeader: "Authorization",
+					AuthScheme: "bearer",
+					StaticHeaders: map[string]string{
+						"x-opencode-client": "desktop",
+						"User-Agent":        "opencode/1.18.31",
+					},
+				},
+				APIKey:        "sk-zen",
+				Body:          []byte(`{"model":"` + tt.model + `","messages":[{"role":"user","content":"hi"}],"stream":true}`),
+				IsStream:      true,
+				TranslateResp: false,
+			}
+			if err := ForwardOpencodeZen(rec, req); err != nil {
+				t.Fatalf("ForwardOpencodeZen: %v", err)
+			}
+			if path != tt.want {
+				t.Errorf("model %q reached %q, want the inference gate %q", tt.model, path, tt.want)
+			}
+			if auth != "Bearer public" {
+				t.Errorf("model %q sent %q, want the public credential the gate expects", tt.model, auth)
+			}
+			if ua != proxy.DefaultOpenCodeUA {
+				t.Errorf("model %q sent User-Agent %q, want the v2 identity %q", tt.model, ua, proxy.DefaultOpenCodeUA)
+			}
+			if client != "cli" {
+				t.Errorf("model %q sent x-opencode-client %q, want cli", tt.model, client)
+			}
+		})
+	}
+}
+
+// A free-tier id on the messages lane travels through the same stealth-capable
+// forwarder as the other free lanes: the /inference/v1 prefix, the public
+// credential, the v2 cli identity, and the read/shell fingerprint. It used to
+// take the plain DoRequest path, which the gate refuses on a direct dial — the
+// request only passed when an edge relay made the call.
+func TestForwardZenMessages_FreeLaneTakesTheStealthForwarder(t *testing.T) {
+	probe := newZenProbe(t, zenMessagesReply)
+	rec := httptest.NewRecorder()
+	req := &Request{
+		Ctx:      context.Background(),
+		Client:   probe.server.Client(),
+		Config:   zenConfig(probe),
+		APIKey:   "sk-zen",
+		Body:     []byte(`{"model":"claude-sonnet-4-6-free","max_tokens":256,"system":"be brief","messages":[{"role":"user","content":"hi"}],"stream":true}`),
+		IsStream: true,
+	}
+	if err := forwardZenMessages(rec, req, "claude-sonnet-4-6-free", true, providers.FormatClaude); err != nil {
+		t.Fatalf("forwardZenMessages: %v", err)
+	}
+	if probe.path != "/inference/v1/messages" {
+		t.Errorf("expected the inference messages lane, got %q", probe.path)
+	}
+	if probe.auth != "Bearer public" {
+		t.Errorf("expected the public credential, got %q", probe.auth)
+	}
+	if probe.body["system"] != "be brief" {
+		t.Errorf("a native Claude body must not be rewritten, got %v", probe.body)
+	}
+	tools, _ := probe.body["tools"].([]any)
+	for _, name := range []string{"read", "shell"} {
+		found := false
+		for _, tool := range tools {
+			tm, _ := tool.(map[string]any)
+			fn, _ := tm["function"].(map[string]any)
+			if fn["name"] == name {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("missing v2 fingerprint tool %q: %v", name, probe.body)
+		}
 	}
 }

@@ -1,8 +1,8 @@
 package chat
 
 import (
-	"context"
 	json "9router/proxy/internal/fastjson"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +12,7 @@ import (
 
 	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/log"
+	"9router/proxy/internal/middleware"
 	internalproxy "9router/proxy/internal/proxy"
 	"9router/proxy/internal/proxy/executor"
 	"9router/proxy/internal/translator"
@@ -69,7 +70,7 @@ func (h *ChatHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Error("chat", "read body failed", "error", err)
-		handlerutil.WriteJSONError(w, http.StatusBadRequest, "failed to read request body")
+		middleware.WriteBodyReadError(w, r, err)
 		return
 	}
 	defer r.Body.Close()
@@ -87,7 +88,6 @@ func (h *ChatHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		handlerutil.WriteJSONError(w, http.StatusBadRequest, "missing model")
 		return
 	}
-
 
 	// Per-key model policy: 403 before the responses bridge or any connection
 	// selection.
@@ -154,6 +154,10 @@ func (h *ChatHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 // translation when the source format already equals the target format.
 func (h *ChatHandler) newResponsesContext(r *http.Request, requestedModel string, modelInfo *ModelInfo, body *[]byte) context.Context {
 	ctx := handlerutil.WithSessionID(r.Context(), handlerutil.ExtractSessionID(r))
+	// Provider-scope limit state, installed where the request's context is built
+	// so every candidate this request tries shares one memory of which providers
+	// were full (docs/provider-limits-plan.md D7).
+	ctx = withProviderLimitState(ctx)
 	ctx = translator.WithClientFormat(ctx, translator.ClientFormatResponses)
 	ctx = translator.WithRequestedModel(ctx, stripModelContextMarker(requestedModel))
 	// The dispatching key decides which guardrail policy governs the response.

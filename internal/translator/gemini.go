@@ -15,6 +15,13 @@ import (
 type GeminiStreamState struct {
 	MessageStartSent     bool
 	MessageId            string
+	// SessionID is the conversation this stream belongs to, taken from the
+	// client's session header. A thought signature is only valid for the call
+	// it was issued for, so the store is namespaced by the conversation that
+	// produced it rather than by the per-response MessageId — two parallel
+	// conversations on one account mint the same tool_call ids often enough
+	// that a global key replays the other one's signature.
+	SessionID            string
 	Model                string
 	Usage                *OpenAIUsage
 	FinishReason         string
@@ -154,6 +161,14 @@ type GeminiStreamChunk struct {
 
 // TranslateOpenAIToGemini converts an OpenAI-compatible request body to Gemini native format.
 func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
+	return TranslateOpenAIToGeminiWithSession(openaiBody, "")
+}
+
+// TranslateOpenAIToGeminiWithSession is TranslateOpenAIToGemini for a request
+// that carries a conversation id. sessionID scopes the thought-signature
+// lookup, so a signature stored by another conversation on the same account is
+// never replayed here.
+func TranslateOpenAIToGeminiWithSession(openaiBody []byte, sessionID string) ([]byte, error) {
 	var oreq struct {
 		Model               string         `json:"model"`
 		Messages            jsontext.Value `json:"messages"`
@@ -286,7 +301,7 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
 				}
 				ts := extractThoughtSig(tc.ID)
 				if ts == "" {
-					ts = GetGeminiThoughtSignature(tc.ID, "", oreq.Model)
+					ts = GetGeminiThoughtSignature(tc.ID, sessionID, oreq.Model)
 				}
 				if ts == "" && !firstFunctionCallSeen {
 					ts = DefaultThinkingSignature
@@ -377,7 +392,7 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
 
 	// Normalize Gemini contents: merge adjacent same-role messages, strip empty parts,
 	// and ensure first turn is "user" (parity with decolua/9router v0.5.75 #e7b5f09).
-	req.Contents = NormalizeGeminiContents(req.Contents)
+	req.Contents = NormalizeGeminiContentsForModel(req.Contents, oreq.Model)
 
 	// Tools
 	if len(oreq.Tools) > 0 {
@@ -407,15 +422,17 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
 
 	// Generation config
 	genConfig := make(map[string]any)
-	if oreq.Temperature != nil {
-		genConfig["temperature"] = *oreq.Temperature
-	}
-
-	if oreq.TopP != nil {
-		genConfig["topP"] = *oreq.TopP
-	}
-	if oreq.TopK != nil {
-		genConfig["topK"] = *oreq.TopK
+	isGemini4 := isGemini4Model(oreq.Model)
+	if !isGemini4 {
+		if oreq.Temperature != nil {
+			genConfig["temperature"] = *oreq.Temperature
+		}
+		if oreq.TopP != nil {
+			genConfig["topP"] = *oreq.TopP
+		}
+		if oreq.TopK != nil {
+			genConfig["topK"] = *oreq.TopK
+		}
 	}
 	maxTokens := oreq.MaxTokens
 	if maxTokens == nil {
@@ -460,7 +477,28 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
 	return out, nil
 }
 
-// extractThoughtSig extracts a thought_signature encoded in a tool call ID (format: "...__ts__<sig>").
+func isGemini4Model(model string) bool {
+	m := strings.ToLower(model)
+	return strings.Contains(m, "gemini-4") || strings.Contains(m, "gemini-argon")
+}
+
+// moveFunctionResponsesLast places all functionResponse parts at the end of the parts array for Gemini 4 models.
+func moveFunctionResponsesLast(parts []GeminiPart) []GeminiPart {
+	var nonResp []GeminiPart
+	var resp []GeminiPart
+	for _, p := range parts {
+		if p.FunctionResponse != nil {
+			resp = append(resp, p)
+		} else {
+			nonResp = append(nonResp, p)
+		}
+	}
+	if len(resp) == 0 {
+		return parts
+	}
+	return append(nonResp, resp...)
+}
+
 func extractThoughtSig(id string) string {
 	const sep = "__ts__"
 	if _, after, ok := strings.CutLast(id, sep); ok && after != "" {
@@ -755,7 +793,15 @@ func TranslateGeminiChunkToOpenAI(chunk []byte, state *GeminiStreamState) ([]byt
 						sig = state.LastThoughtSignature
 					}
 					if sig != "" {
-						StoreGeminiThoughtSignature(id, sig, state.MessageId, state.Model)
+						// Keyed by the conversation, not by this response's id:
+						// the response id changes on every turn, so it could
+						// never be looked up on the next one, and the lookup
+						// fell back to a global key another conversation shares.
+						storeSession := state.SessionID
+						if storeSession == "" {
+							storeSession = state.MessageId
+						}
+						StoreGeminiThoughtSignature(id, sig, storeSession, state.Model)
 						id += "__ts__" + sig
 					}
 					delta["tool_calls"] = []map[string]any{
@@ -1008,6 +1054,12 @@ func geminiToolMediaParts(content any) []GeminiPart {
 // prefill, a truncated stream, or tool calls the client never answered all
 // arrive that way and would 400 without the guards.
 func NormalizeGeminiContents(contents []GeminiContent) []GeminiContent {
+	return NormalizeGeminiContentsForModel(contents, "")
+}
+
+// NormalizeGeminiContentsForModel allows passing model name to conditionally apply Gemini 4 functionResponse ordering.
+func NormalizeGeminiContentsForModel(contents []GeminiContent, model string) []GeminiContent {
+	isGemini4 := isGemini4Model(model)
 	out := make([]GeminiContent, 0, len(contents)+2)
 	for _, c := range contents {
 		if c.Role == "" || len(c.Parts) == 0 {
@@ -1024,11 +1076,19 @@ func NormalizeGeminiContents(contents []GeminiContent) []GeminiContent {
 			continue
 		}
 		if len(out) > 0 && out[len(out)-1].Role == c.Role {
-			out[len(out)-1].Parts = append(out[len(out)-1].Parts, validParts...)
+			merged := append(out[len(out)-1].Parts, validParts...)
+			if c.Role == "user" && isGemini4 {
+				merged = moveFunctionResponsesLast(merged)
+			}
+			out[len(out)-1].Parts = merged
 		} else {
+			parts := validParts
+			if c.Role == "user" && isGemini4 {
+				parts = moveFunctionResponsesLast(parts)
+			}
 			out = append(out, GeminiContent{
 				Role:  c.Role,
-				Parts: validParts,
+				Parts: parts,
 			})
 		}
 	}

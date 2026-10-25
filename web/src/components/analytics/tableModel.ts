@@ -25,6 +25,7 @@ export type SortField = keyof UsageRow | string
 
 export const TABLE_SOURCE: Record<TableView, keyof StatsData> = {
   model: 'byModel',
+  provider: 'byProvider',
   account: 'byAccount',
   apiKey: 'byApiKey',
   endpoint: 'byEndpoint',
@@ -32,6 +33,7 @@ export const TABLE_SOURCE: Record<TableView, keyof StatsData> = {
 
 export const TABLE_STORAGE_KEY: Record<TableView, string> = {
   model: 'usage-stats:expanded-models',
+  provider: 'usage-stats:expanded-providers',
   account: 'usage-stats:expanded-accounts',
   apiKey: 'usage-stats:expanded-apikeys',
   endpoint: 'usage-stats:expanded-endpoints',
@@ -39,6 +41,7 @@ export const TABLE_STORAGE_KEY: Record<TableView, string> = {
 
 export const TABLE_EMPTY_MESSAGE: Record<TableView, string> = {
   model: 'No usage recorded yet.',
+  provider: 'No provider usage recorded yet.',
   account: 'No account-specific usage recorded yet.',
   apiKey: 'No API key usage recorded yet.',
   endpoint: 'No endpoint usage recorded yet.',

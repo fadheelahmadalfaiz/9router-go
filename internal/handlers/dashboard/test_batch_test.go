@@ -184,11 +184,11 @@ func TestHandleTestBatch_SelectsByModeAndProvider(t *testing.T) {
 				got = append(got, result.ConnectionID)
 			}
 			for _, want := range tt.wantIDs {
-				if !contains(got, want) {
+				if !containsString(got, want) {
 					t.Errorf("results %v missing %q", got, want)
 				}
 			}
-			if contains(got, "conn-off") {
+			if containsString(got, "conn-off") {
 				t.Error("a disabled connection must never be probed")
 			}
 		})
@@ -286,8 +286,7 @@ func TestIsCompatibleProviderID(t *testing.T) {
 		})
 	}
 }
-
-func contains(haystack []string, needle string) bool {
+func containsString(haystack []string, needle string) bool {
 	for _, item := range haystack {
 		if item == needle {
 			return true

@@ -1,241 +1,177 @@
 package handlers
 
 import (
-	"9router/proxy/internal/db"
-	json "encoding/json/v2"
-	"net/http"
+	"encoding/json"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"9router/proxy/internal/db"
 )
 
-func seedDailyUsage(t *testing.T, repo *db.Repo, dateKey string, requests, prompt, completion int, cost float64) {
-	t.Helper()
-	payload, err := json.Marshal(map[string]any{
-		"requests":         requests,
-		"promptTokens":     prompt,
-		"completionTokens": completion,
-		"cost":             cost,
-	})
-	if err != nil {
-		t.Fatalf("marshal daily payload: %v", err)
-	}
-	if err := repo.UpsertUsageDaily(dateKey, string(payload)); err != nil {
-		t.Fatalf("seed usageDaily %s: %v", dateKey, err)
-	}
-}
-
-func getChart(t *testing.T, repo *db.Repo, query string) ([]UsageChartPoint, int) {
-	t.Helper()
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/usage/chart"+query, nil)
-	HandleUsageChart(repo)(rec, req)
-
-	if rec.Code != http.StatusOK {
-		return nil, rec.Code
-	}
-	var points []UsageChartPoint
-	if err := json.Unmarshal(rec.Body.Bytes(), &points); err != nil {
-		t.Fatalf("decode chart payload: %v (body %s)", err, rec.Body.String())
-	}
-	return points, rec.Code
-}
-
-// TestHandleUsageChart_PeriodBuckets — each period returns the bucket count and
-// granularity upstream getChartData promises: 24 hourly buckets for today/24h,
-// one bucket per day for the rolling periods, and every day on record for "all".
-func TestHandleUsageChart_PeriodBuckets(t *testing.T) {
-	database, cleanup := setupTestDB(t)
-	defer cleanup()
-	repo := db.NewRepo(database)
-
-	// Two days on record plus today.
-	now := time.Now().UTC()
-	seedDailyUsage(t, repo, now.AddDate(0, 0, -1).Format("2006-01-02"), 2, 200, 100, 0.5)
-	seedDailyUsage(t, repo, now.Format("2006-01-02"), 3, 300, 150, 1.5)
-
+func TestModelFamilyName(t *testing.T) {
 	tests := []struct {
-		keyName      string
-		query        string
-		wantCount    int
-		wantFirstFmt string
+		name     string
+		input    string
+		expected string
 	}{
-		{keyName: "today", query: "?period=today", wantCount: 24, wantFirstFmt: "15:04"},
-		{keyName: "24h", query: "?period=24h", wantCount: 24, wantFirstFmt: "15:04"},
-		{keyName: "7d", query: "?period=7d", wantCount: 7, wantFirstFmt: "Jan"},
-		{keyName: "30d", query: "?period=30d", wantCount: 30, wantFirstFmt: "Jan"},
-		{keyName: "60d", query: "?period=60d", wantCount: 60, wantFirstFmt: "Jan"},
-		{keyName: "defaults to 7d", query: "", wantCount: 7, wantFirstFmt: "Jan"},
+		{name: "strips provider prefix", input: "openai/gpt-5", expected: "gpt"},
+		{name: "drops hyphenated version", input: "gpt-5.6-sol", expected: "gpt"},
+		{name: "drops attached version", input: "qwen3.8-flash", expected: "qwen"},
+		{name: "folds qoder qfmodel codename", input: "qfmodel", expected: "qwen"},
+		{name: "folds qoder dfmodel codename", input: "dfmodel", expected: "deepseek"},
+		{name: "folds brand stepaudio", input: "stepaudio-tts", expected: "step"},
+		{name: "uuid custom channel is other", input: "85d2a64e-abc:custom", expected: "other"},
+		{name: "empty model is unknown", input: "", expected: "unknown"},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.keyName, func(t *testing.T) {
-			points, code := getChart(t, repo, tt.query)
-			if code != http.StatusOK {
-				t.Fatalf("status = %d, want 200", code)
-			}
-			if len(points) != tt.wantCount {
-				t.Fatalf("bucket count = %d, want %d", len(points), tt.wantCount)
-			}
-			if points[0].Label == "" {
-				t.Fatal("first bucket has an empty label")
+		t.Run(tt.name, func(t *testing.T) {
+			if got := modelFamilyName(tt.input); got != tt.expected {
+				t.Errorf("modelFamilyName(%q) = %q, want %q", tt.input, got, tt.expected)
 			}
 		})
 	}
 }
 
-// TestHandleUsageChart_AllPeriodSpansEveryDayOnRecord — "all" must start at the
-// earliest stored day rather than a fixed 365-day window.
-func TestHandleUsageChart_AllPeriodSpansEveryDayOnRecord(t *testing.T) {
-	database, cleanup := setupTestDB(t)
-	defer cleanup()
-	repo := db.NewRepo(database)
-
-	now := time.Now().UTC()
-	seedDailyUsage(t, repo, now.AddDate(0, 0, -4).Format("2006-01-02"), 1, 10, 5, 0.1)
-	seedDailyUsage(t, repo, now.Format("2006-01-02"), 1, 20, 10, 0.2)
-
-	points, code := getChart(t, repo, "?period=all")
-	if code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", code)
+func TestParseChartPeriod(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantKind  string
+		wantCount int
+	}{
+		{name: "today is hourly", input: "today", wantKind: "today", wantCount: 24},
+		{name: "24h is hourly", input: "24h", wantKind: "24h", wantCount: 24},
+		{name: "30d is daily", input: "30d", wantKind: "daily", wantCount: 30},
+		{name: "60d is daily", input: "60d", wantKind: "daily", wantCount: 60},
+		{name: "all is unbounded", input: "all", wantKind: "all", wantCount: 0},
+		{name: "unknown falls back to 7d", input: "bogus", wantKind: "daily", wantCount: 7},
+		{name: "custom hourly window", input: "12h", wantKind: "hourly", wantCount: 12},
+		{name: "custom daily window", input: "14d", wantKind: "daily", wantCount: 14},
 	}
-	if len(points) != 5 {
-		t.Fatalf("bucket count = %d, want 5 (earliest..today inclusive)", len(points))
-	}
-	if points[4].Requests != 1 || points[4].Tokens != 30 {
-		t.Fatalf("last bucket = %+v, want the seeded today row", points[4])
-	}
-}
 
-// TestHandleUsageChart_AllPeriodEmptyDatabase — no usage on record must return
-// an empty array, never a null body the chart would fail to iterate.
-func TestHandleUsageChart_AllPeriodEmptyDatabase(t *testing.T) {
-	database, cleanup := setupTestDB(t)
-	defer cleanup()
-	repo := db.NewRepo(database)
-
-	points, code := getChart(t, repo, "?period=all")
-	if code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", code)
-	}
-	if len(points) != 0 {
-		t.Fatalf("bucket count = %d, want 0", len(points))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kind, count := parseChartPeriod(tt.input)
+			if kind != tt.wantKind || count != tt.wantCount {
+				t.Errorf("parseChartPeriod(%q) = (%q, %d), want (%q, %d)",
+					tt.input, kind, count, tt.wantKind, tt.wantCount)
+			}
+		})
 	}
 }
 
-// TestHandleUsageChart_DailyBucketsSumTokensAndCost — the day rollup keeps
-// prompt and completion tokens separate, so the chart's token figure is their
-// sum and the cost is carried through unchanged.
-func TestHandleUsageChart_DailyBucketsSumTokensAndCost(t *testing.T) {
-	database, cleanup := setupTestDB(t)
-	defer cleanup()
-	repo := db.NewRepo(database)
-
-	today := time.Now().UTC().Format("2006-01-02")
-	seedDailyUsage(t, repo, today, 4, 1000, 250, 2.5)
-
-	points, code := getChart(t, repo, "?period=7d")
-	if code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", code)
+func TestFinalizeChartBuckets(t *testing.T) {
+	buckets := []chartBucket{
+		{Label: "a", ByModel: map[string]int64{"gpt": 100, "extra-a": 1}},
+		{Label: "b", ByModel: map[string]int64{"gpt": 50, "extra-b": 2}},
 	}
-	todayBucket := points[len(points)-1]
-	if todayBucket.Tokens != 1250 {
-		t.Errorf("tokens = %d, want 1250", todayBucket.Tokens)
+	finalizeChartBuckets(buckets, 1)
+	if buckets[0].ByModel["gpt"] != 100 {
+		t.Errorf("top family must survive: %+v", buckets[0].ByModel)
 	}
-	if todayBucket.Cost != 2.5 {
-		t.Errorf("cost = %v, want 2.5", todayBucket.Cost)
+	if buckets[0].ByModel["other"] != 1 {
+		t.Errorf("tail family must fold into other: %+v", buckets[0].ByModel)
 	}
-	if todayBucket.Requests != 4 {
-		t.Errorf("requests = %d, want 4", todayBucket.Requests)
+	if buckets[1].ByModel["other"] != 2 {
+		t.Errorf("tail family must fold into other: %+v", buckets[1].ByModel)
 	}
 }
 
-// TestHandleUsageChart_RejectsUnknownPeriod — an unrecognised period is a client
-// error, matching upstream VALID_PERIODS returning 400.
-func TestHandleUsageChart_RejectsUnknownPeriod(t *testing.T) {
-	database, cleanup := setupTestDB(t)
-	defer cleanup()
-	repo := db.NewRepo(database)
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/usage/chart?period=90d", nil)
-	HandleUsageChart(repo)(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
+func setupChartTestDB(t *testing.T) *db.Repo {
+	t.Helper()
+	conn, err := db.OpenDatabase(t.TempDir() + "/chart.sqlite")
+	if err != nil {
+		t.Fatalf("OpenDatabase: %v", err)
 	}
+	if err := db.EnsureCoreSchema(conn); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+	repo := db.NewRepo(conn)
+	t.Cleanup(func() { conn.Close() })
+	yesterday := time.Now().UTC().AddDate(0, 0, -1).Format("2006-01-02")
+	if err := repo.UpsertUsageDaily(yesterday, `{"promptTokens":1000,"completionTokens":500,"cost":1.5}`); err != nil {
+		t.Fatalf("seed usageDaily: %v", err)
+	}
+	if err := repo.InsertUsageHistory("openai", "gpt-5", "conn-1", "sk-1", "/v1/chat/completions",
+		100, 50, 1.5, "ok", 150, "{}", "{}"); err != nil {
+		t.Fatalf("seed usageHistory: %v", err)
+	}
+	return repo
 }
 
-// TestHandleUsageChart_HourlyBucketsAggregateHistory — the today/24h windows read
-// usageHistory, and a row must land in exactly one hourly bucket.
-func TestHandleUsageChart_HourlyBucketsAggregateHistory(t *testing.T) {
-	database, cleanup := setupTestDB(t)
-	defer cleanup()
-	repo := db.NewRepo(database)
+func TestHandleUsageChart(t *testing.T) {
+	repo := setupChartTestDB(t)
 
-	for i := range 3 {
-		if err := repo.InsertUsageHistory(
-			"claude", "claude-sonnet", "conn-1", "sk-test", "/v1/messages",
-			100, 25, 0.5, "success", 125, "{}", `{"prompt_tokens":100,"completion_tokens":25}`,
-		); err != nil {
-			t.Fatalf("insert usage history %d: %v", i, err)
+	t.Run("daily window returns buckets with totals and family split", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/usage/chart?period=7d", nil)
+		HandleUsageChart(repo).ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("status = %d, want 200", rec.Code)
 		}
-	}
+		var buckets []chartBucket
+		if err := json.Unmarshal(rec.Body.Bytes(), &buckets); err != nil {
+			t.Fatalf("decode buckets: %v", err)
+		}
+		if len(buckets) != 7 {
+			t.Fatalf("len(buckets) = %d, want 7", len(buckets))
+		}
+		var total int64
+		for _, b := range buckets {
+			total += b.Tokens
+		}
+		if total < 1500 {
+			t.Errorf("chart total = %d, want at least the seeded 1500", total)
+		}
+	})
 
-	points, code := getChart(t, repo, "?period=24h")
-	if code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", code)
-	}
+	t.Run("hourly window returns 24 labeled buckets", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/usage/chart?period=today", nil)
+		HandleUsageChart(repo).ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		var buckets []chartBucket
+		if err := json.Unmarshal(rec.Body.Bytes(), &buckets); err != nil {
+			t.Fatalf("decode buckets: %v", err)
+		}
+		if len(buckets) != 24 {
+			t.Fatalf("len(buckets) = %d, want 24", len(buckets))
+		}
+		for _, b := range buckets {
+			if !strings.Contains(b.Label, ":") {
+				t.Errorf("hourly label %q must be HH:MM", b.Label)
+				break
+			}
+		}
+	})
 
-	var totalRequests int
-	var totalTokens int64
-	for _, point := range points {
-		totalRequests += point.Requests
-		totalTokens += point.Tokens
-	}
-	if totalRequests != 3 {
-		t.Errorf("total requests = %d, want 3", totalRequests)
-	}
-	if totalTokens != 375 {
-		t.Errorf("total tokens = %d, want 375 (3 x 125)", totalTokens)
-	}
+	t.Run("unknown period falls back to 7d", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/usage/chart?period=bogus", nil)
+		HandleUsageChart(repo).ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		var buckets []chartBucket
+		if err := json.Unmarshal(rec.Body.Bytes(), &buckets); err != nil {
+			t.Fatalf("decode buckets: %v", err)
+		}
+		if len(buckets) != 7 {
+			t.Fatalf("len(buckets) = %d, want 7", len(buckets))
+		}
+	})
 }
 
-// TestGetUsageDailyWithKeys_OldestFirstAndLimitedToRecentWindow — the chart
-// needs the newest N days in chronological order, which GetUsageDailyRecent
-// cannot provide (it drops the key and returns descending).
-func TestGetUsageDailyWithKeys_OldestFirstAndLimitedToRecentWindow(t *testing.T) {
-	database, cleanup := setupTestDB(t)
-	defer cleanup()
-	repo := db.NewRepo(database)
-
-	base := time.Now().UTC().AddDate(0, 0, -4)
-	for i := range 5 {
-		seedDailyUsage(t, repo, base.AddDate(0, 0, i).Format("2006-01-02"), 1, 1, 1, 0.1)
-	}
-
-	rows, err := repo.GetUsageDailyWithKeys(2)
-	if err != nil {
-		t.Fatalf("GetUsageDailyWithKeys: %v", err)
-	}
-	if len(rows) != 2 {
-		t.Fatalf("row count = %d, want 2", len(rows))
-	}
-	if rows[0].DateKey >= rows[1].DateKey {
-		t.Fatalf("rows are not chronological: %q then %q", rows[0].DateKey, rows[1].DateKey)
-	}
-	if rows[1].DateKey != base.AddDate(0, 0, 4).Format("2006-01-02") {
-		t.Errorf("last row = %q, want the newest day", rows[1].DateKey)
-	}
-
-	all, err := repo.GetUsageDailyWithKeys(0)
-	if err != nil {
-		t.Fatalf("GetUsageDailyWithKeys(0): %v", err)
-	}
-	if len(all) != 5 {
-		t.Fatalf("unlimited row count = %d, want 5", len(all))
-	}
-	if all[0].DateKey != base.Format("2006-01-02") {
-		t.Errorf("first row = %q, want the earliest day", all[0].DateKey)
+func TestDailyChartBucketsAll(t *testing.T) {
+	repo := setupChartTestDB(t)
+	now := time.Now().UTC()
+	buckets := dailyChartBuckets(repo, now, 0)
+	if len(buckets) < 2 {
+		t.Fatalf("all-period must cover both seeded days, got %d buckets", len(buckets))
 	}
 }

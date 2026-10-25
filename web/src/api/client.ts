@@ -3,6 +3,17 @@ export interface DatabaseStats {
   reclaimableBytes: number
   requestDetailsCount: number
   usageHistoryCount: number
+  usageHistoryOldestTimestamp?: string
+  usageHistoryNewestTimestamp?: string
+}
+
+export interface PruneUsageResult {
+  success: boolean
+  dryRun: boolean
+  wouldDelete?: number
+  pruned?: number
+  carriedTokens?: number
+  cutoff: string
 }
 // Typed API client for 9router-go Native Dashboard
 
@@ -36,8 +47,43 @@ export interface Combo {
   strategy: string
   createdAt: string
   updatedAt: string
+  /** Raw JSON of the combo's smart rules. Absent means the combo has none. */
+  matchRules?: string
+  /** Derived server-side: the members the rules currently own. */
+  autoMembers?: string[]
 }
 
+/** One smart-select rule: a pattern plus the membership it currently owns. */
+export interface SmartRule {
+  id: string
+  pattern: string
+  mode: 'glob' | 'keyword' | 'regex'
+  effect: 'include' | 'exclude'
+  enabled: boolean
+  /** 0 means unlimited. */
+  maxMembers: number
+  allKinds: boolean
+  resolved?: string[]
+  excluded?: string[]
+}
+
+/** What one rule would contribute, as the preview endpoint reports it. */
+export interface SmartRulePreview {
+  id: string
+  matched: number
+  applied: number
+  capped: boolean
+}
+
+/** The dry run of a rule list against the live model set. */
+export interface ComboRulesPreview {
+  combo: string
+  candidates: number
+  models: string[]
+  added: string[]
+  removed: string[]
+  rules: SmartRulePreview[]
+}
 /** Resolved server-side capabilities for one catalog model. */
 export interface ModelCaps {
   vision: boolean
@@ -87,23 +133,60 @@ export interface APIKey {
   rateLimitRpm?: number
   rateLimitTpm?: number
   rateLimitConcurrency?: number
+  /** Lifetime prompt+completion token budget. 0 means unlimited. */
+  tokenQuota?: number
+  /** Spend recorded against tokenQuota since the budget was last reset (#365). */
+  usedTokens?: number
+  /** How long a request waits for a free concurrency slot, in ms. 0 uses the server default. */
+  queueTimeoutMs?: number
   /** RFC3339 UTC. Empty means the key never expires. */
   expiresAt?: string
   lastUsedAt?: string
   usedCount?: number
   /** Free-form JSON object, e.g. { customerId, priceCents }. */
   metadata?: string
+  /** Plan template this key inherits from. Empty means no plan. */
+  planId?: string
 }
 
 export interface APIKeyPolicy {
   rateLimitRpm?: number
   rateLimitTpm?: number
   rateLimitConcurrency?: number
+  /** Lifetime token budget. 0 means unlimited. */
+  tokenQuota?: number
+  /** Concurrency queue timeout in ms. 0 uses the server default. */
+  queueTimeoutMs?: number
   expiresAt?: string
   metadata?: string
   /** Renames the key. An empty string clears the stored name. */
   name?: string
+  /** Plan template to inherit. An empty string detaches the key. */
+  planId?: string
 }
+
+/** A reusable policy template (F-3). Keys inherit its limits as defaults. */
+export interface Plan {
+  id: string
+  name: string
+  description: string
+  limitMicros: number
+  limitTokens: number
+  rpmLimit: number
+  tpmLimit: number
+  concurrencyLimit: number
+  period: PlanPeriod
+  alertPct: number
+  hardCutoff: boolean
+  allowedModels: string[]
+  createdAt: string
+  updatedAt: string
+}
+
+export type PlanPeriod = 'daily' | 'weekly' | 'monthly' | 'total'
+
+/** A plan write. Omitted fields keep their stored value on update. */
+export type PlanInput = Partial<Omit<Plan, 'id' | 'createdAt' | 'updatedAt'>>
 
 export interface GuardrailPolicy {
   id: string
@@ -199,10 +282,31 @@ export interface Settings {
   /** Serve requests from the account that frees up first when all are cooling down. */
   forceFallback?: boolean
   enableObservability?: boolean
+  /** Global system prompt: prefix leads the system prompt, suffix ends it. */
+  systemPromptEnabled?: boolean
+  systemPromptPrefix?: string
+  systemPromptSuffix?: string
   outboundProxyEnabled?: boolean
   outboundProxyUrl?: string
   outboundNoProxy?: string
   providerStrategies?: Record<string, ProviderStrategyConfig>
+  /**
+   * Sidebar layout: the entry ids the operator hid, and the arrangement they
+   * moved the entries into. The canonical id list lives in web/src/lib/nav.ts;
+   * the server only checks the shape
+   * (internal/handlers/dashboard/navvisibility.go).
+   */
+  navVisibility?: { hidden?: string[]; order?: string[] }
+  /**
+   * Display currency for every cost surface. Costs themselves are stored in USD;
+   * see web/src/lib/currency.ts for the catalog and the formatting rules.
+   */
+  displayCurrency?: {
+    code?: string
+    rates?: Record<string, number>
+    showBoth?: boolean
+    updatedAt?: string
+  }
   [key: string]: unknown
 }
 
@@ -418,14 +522,31 @@ export interface ProviderNode {
   urlSuffixGenerated?: boolean
   createdAt?: string
   updatedAt?: string
+  /**
+   * The node's capacity policy plus what it has spent against it. Filled by the
+   * list endpoint, so the dashboard never has to make a second call to discover
+   * what a node is currently allowed.
+   */
+  limits?: ProviderNodeLimits
 }
 
-/** One bucket of /api/usage/chart. Mirrors the upstream chart contract. */
-export interface UsageChartPoint {
-  label: string
-  tokens: number
-  cost: number
-  requests: number
+/**
+ * ProviderNodeLimits mirrors the Go side (ProviderNodeLimitsResponse). Live
+ * figures (`rpmUsedWindow`, `activeConcurrency`) come from the gateway's own
+ * limiter and read 0 when nothing has been metered yet.
+ */
+export interface ProviderNodeLimits {
+  rpm: number
+  tpm: number
+  concurrency: number
+  tokenQuota: number
+  queueTimeoutMs: number
+  quotaResetId: number
+  contractExpiresAt?: string
+  usedTokens: number
+  expired: boolean
+  rpmUsedWindow: number
+  activeConcurrency: number
 }
 
 /** Which slice of connections POST /api/providers/test-batch should probe. */
@@ -458,6 +579,36 @@ export interface BatchTestResponse {
   testedAt: string
 }
 
+/**
+ * ProviderNodeLimitsPatch is the write side. Every field is optional and an
+ * omitted field keeps its stored value — sending `0` is what clears one, and the
+ * distinction is the whole reason this is a separate call from updateProviderNode.
+ */
+export interface ProviderNodeLimitsPatch {
+  rpm?: number
+  tpm?: number
+  concurrency?: number
+  tokenQuota?: number
+  queueTimeoutMs?: number
+  /** RFC3339 or a date (YYYY-MM-DD); "" clears the expiry. */
+  contractExpiresAt?: string
+}
+
+/**
+ * CustomModelBatchEntry is one line of a bulk save. Capabilities travel per entry
+ * even though the dashboard sends them uniformly for the whole paste (D10): the
+ * endpoint stays general, and a caller that already holds per-entry values is not
+ * forced to collapse them into one set.
+ */
+export interface CustomModelBatchEntry {
+  id: string
+  name?: string
+  type?: string
+  vision?: boolean
+  reasoning?: boolean
+  contextWindow?: number
+  maxOutput?: number
+}
 
 export interface SystemVersionInfo {
   currentVersion: string
@@ -504,6 +655,52 @@ export interface ConnectionUsageResponse {
   plan?: string
   quotas?: Record<string, ConnectionQuotaInfo> | ConnectionQuotaInfo[]
   error?: string
+}
+
+// Usage dashboard (Details section): heatmap cells, lifetime cards, node health.
+export interface UsageDailyPoint {
+  date: string
+  requests: number
+  tokens: number
+  cost: number
+}
+export interface UsageTopModel {
+  model: string
+  provider?: string
+  tokens: number
+}
+export interface UsageLifetime {
+  totalRequests: number
+  totalTokens: number
+  peakTokens: number
+  peakDate: string
+  currentStreak: number
+  longestStreak: number
+  topModel: UsageTopModel | null
+  cacheHitRate: number | null
+}
+export interface UsageNodeHealth {
+  name?: string
+  model?: string
+  provider: string
+  requests: number
+  errors: number
+  successRate: number
+  avgLatencyMs: number | null
+  avgTtftMs: number | null
+  avgSpeed: number | null
+  hasPerfData: boolean
+  score: number | null
+  promptTokens: number
+  completionTokens: number
+  cost: number
+  lastUsed: string
+}
+export interface UsageDashboardResponse {
+  daily: UsageDailyPoint[]
+  nodes: UsageNodeHealth[]
+  models: UsageNodeHealth[]
+  lifetime: UsageLifetime | null
 }
 
 // Codex reset credits. `selectionToken` is the field the dashboard selects
@@ -841,12 +1038,19 @@ export function onUnauthorized(listener: UnauthorizedListener): () => void {
 let unauthorizedTimer: number | null = null
 
 export function handleUnauthorized(path?: string) {
-  // Do not redirect for public auth endpoints or if already on login page
+  // Do not redirect for public auth endpoints, for the storage stats probe, or
+  // if already on the login page. The stats probe is read-only and always
+  // admin-gated on the server, so on an install whose dashboard is open without
+  // a session it answers 401 while every other call succeeds — bouncing the
+  // operator to the login screen and clearing the stored key there was wrong;
+  // the storage card reports the 401 and offers a retry instead. A genuinely
+  // expired session still logs out through any other request.
   if (
     path === '/api/auth/login' ||
     path === '/api/auth/status' ||
     path === '/api/settings/require-login' ||
-    path === '/api/changelog'
+    path === '/api/changelog' ||
+    path === '/api/settings/database/stats'
   ) {
     return
   }
@@ -1008,6 +1212,56 @@ export const api = {
       return { supported: false, valid: false }
     }
   },
+  /**
+   * Open a throwaway browser and sign in to Gemini Web, so the session is
+   * captured without a browser that keeps running and rotating the same
+   * cookies. Answers with the cookie header to paste.
+   */
+  geminiWebBrowserLogin: async (): Promise<{ cookie: string }> =>
+    request<{ cookie: string }>('/api/providers/gemini-web/browser-login', { method: 'POST' }),
+  /**
+   * Open a throwaway browser and sign in to DeepSeek Web, so the credential is
+   * captured without a browser that keeps running and rotating the same
+   * session.
+   *
+   * Answers with both halves of the credential: the userToken the API
+   * authenticates with, and the site's own cookies the WAF reads.
+   */
+  deepSeekWebBrowserLogin: async (): Promise<{ userToken: string; cookie: string }> =>
+    request<{ userToken: string; cookie: string }>('/api/providers/deepseek-web/browser-login', {
+      method: 'POST',
+    }),
+  /**
+   * Read the DeepSeek credential out of a browser that is already signed in,
+   * and answer with both halves of it: the userToken the API authenticates
+   * with, and the site's own cookies the WAF reads.
+   *
+   * The warning says what to do about a browser that is still running.
+   */
+  deepSeekWebImportChrome: async (profile?: string): Promise<{ userToken: string; cookie: string; warning: string }> =>
+    request<{ userToken: string; cookie: string; warning: string }>('/api/providers/deepseek-web/import-chrome', {
+      method: 'POST',
+      body: JSON.stringify({ profile: profile ?? '' }),
+    }),
+  /**
+   * Renew one DeepSeek Web connection's credential.
+   *
+   * A browser opens and waits for the sign-in, so this call takes as long as
+   * the operator takes to sign in. The credential that comes back is written
+   * to the row, so there is nothing to paste.
+   */
+  renewDeepSeekCredential: async (id: string): Promise<{ renewed: boolean }> =>
+    request<{ renewed: boolean }>(`/api/connections/${id}/renew-deepseek`, { method: 'POST' }),
+  /**
+   * Read a session out of a browser that is already signed in, and answer with
+   * the cookie header to paste. The warning says what to do about a browser
+   * that is still running.
+   */
+  geminiWebImportChrome: async (profile?: string): Promise<{ cookie: string; warning: string }> =>
+    request<{ cookie: string; warning: string }>('/api/providers/gemini-web/import-chrome', {
+      method: 'POST',
+      body: JSON.stringify({ profile: profile ?? '' }),
+    }),
   updateConnection: (
     id: string,
     payload:
@@ -1095,6 +1349,26 @@ export const api = {
     request<{ success: boolean }>(`/api/provider-nodes/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),
+  /**
+   * Save one node's capacity limits. Separate from updateProviderNode because
+   * that call requires name and prefix on every request: routing a limits edit
+   * through it would mean an empty field in the UI becomes a 400 for the whole
+   * save, and a limits save should never be able to rename a node.
+   */
+  setProviderNodeLimits: (id: string, patch: ProviderNodeLimitsPatch) =>
+    request<{ status: string; id: string; limits: ProviderNodeLimits }>(
+      `/api/provider-nodes/${encodeURIComponent(id)}/limits`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(patch),
+      }
+    ),
+  /** Move a node's quota mark to the end of its history. History is kept. */
+  resetProviderNodeQuota: (id: string) =>
+    request<{ status: string; id: string; quotaResetId: number; limits: ProviderNodeLimits }>(
+      `/api/provider-nodes/${encodeURIComponent(id)}/quota/reset`,
+      { method: 'POST' }
+    ),
   /** List models from a connection's upstream (compatible nodes; upstream GET /api/providers/[id]/models). */
   getConnectionModels: (connectionId: string) =>
     request<{ provider: string; connectionId: string; models: Array<{ id?: string; name?: string; model?: string } | string> }>(
@@ -1106,7 +1380,7 @@ export const api = {
     const res = await request<any>('/api/combos')
     return Array.isArray(res) ? res : (res.combos || [])
   },
-  createCombo: (payload: { id?: string; name: string; kind?: string; models: string | string[]; strategy?: string }) =>
+  createCombo: (payload: { id?: string; name: string; kind?: string; models: string | string[]; strategy?: string; matchRules?: SmartRule[] }) =>
     request<{ success: boolean; id: string }>('/api/combos', {
       method: 'POST',
       body: JSON.stringify(payload),
@@ -1120,6 +1394,18 @@ export const api = {
     request<{ success: boolean }>(`/api/combos/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),
+  /** Dry-run a rule list: what it would add, remove and own. Writes nothing. */
+  previewComboRules: (id: string, matchRules: SmartRule[]) =>
+    request<ComboRulesPreview>(`/api/combos/${encodeURIComponent(id)}/smart/preview`, {
+      method: 'POST',
+      body: JSON.stringify({ matchRules }),
+    }),
+  /** Apply every combo's rules now, or just the named one. */
+  reconcileCombos: (id?: string) =>
+    request<{ status: string; reconciled: number; added: string[]; removed: string[] }>(
+      id ? `/api/combos/reconcile?id=${encodeURIComponent(id)}` : '/api/combos/reconcile',
+      { method: 'POST' },
+    ),
 
   // API Keys
   getApiKeys: () => request<APIKey[]>('/api/keys'),
@@ -1142,6 +1428,16 @@ export const api = {
     request<{ status: string; id: string; key: string }>(`/api/keys/${encodeURIComponent(id)}/rotate`, {
       method: 'POST',
     }),
+  /**
+   * Clears a key's spent token budget (#365). The server stamps the usage mark
+   * the budget is measured from, so the key starts over while its history stays
+   * intact, and the response carries the spend it now has (0).
+   */
+  resetApiKeyQuota: (id: string) =>
+    request<{ status: string; id: string; usedTokens: number; tokenQuota: number; quotaResetId: number }>(
+      `/api/keys/${encodeURIComponent(id)}/reset-quota`,
+      { method: 'POST' },
+    ),
   setApiKeyActive: (id: string, isActive: boolean) =>
     request<{ status: string; id: string; isActive: boolean }>(
       `/api/keys/${encodeURIComponent(id)}/toggle`,
@@ -1163,6 +1459,23 @@ export const api = {
       body: JSON.stringify({ models }),
     }),
 
+  // F-3 plan templates: the reusable policy a key inherits from.
+  getPlans: () => request<{ plans: Plan[] }>('/api/plans'),
+  getPlan: (id: string) => request<Plan>(`/api/plans/${encodeURIComponent(id)}`),
+  createPlan: (plan: PlanInput) =>
+    request<Plan>('/api/plans', { method: 'POST', body: JSON.stringify(plan) }),
+  updatePlan: (id: string, plan: PlanInput) =>
+    request<Plan>(`/api/plans/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(plan),
+    }),
+  deletePlan: (id: string) =>
+    request<{ status: string; id: string }>(`/api/plans/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+  getPlanKeys: (id: string) =>
+    request<{ id: string; keys: number }>(`/api/plans/${encodeURIComponent(id)}/keys`),
+
   // F-5 credential vault
   getVaultStatus: () => request<VaultStatus>('/api/vault/status'),
   rotateVault: (masterKey: string) =>
@@ -1172,9 +1485,12 @@ export const api = {
     }),
 
   // F-4 guardrails
-  getGuardrailPolicies: (scope: string, scopeId = '') =>
+  // No scopeId lists the whole scope (including subject-scoped policies); an
+  // explicit value — even an empty one — resolves one exact scope tuple.
+  getGuardrailPolicies: (scope: string, scopeId?: string) =>
     request<GuardrailPolicy[]>(
-      `/api/guardrails/policies?scope=${encodeURIComponent(scope)}&scopeId=${encodeURIComponent(scopeId)}`
+      `/api/guardrails/policies?scope=${encodeURIComponent(scope)}` +
+        (scopeId === undefined ? '' : `&scopeId=${encodeURIComponent(scopeId)}`)
     ),
   createGuardrailPolicy: (payload: {
     name: string
@@ -1229,10 +1545,38 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ key, value }),
     }),
+  /**
+   * Save a whole pasted list of model ids in one request (D9). The response names
+   * every id it stored and every id it did not, so a partial save is visible
+   * instead of implied by a count that never came back.
+   */
+  saveCustomModelsBulk: (payload: {
+    providerAlias: string
+    type?: string
+    models: CustomModelBatchEntry[]
+  }) =>
+    request<{ status: string; added: string[]; skipped: Array<{ id: string; reason: string; code: string }> }>(
+      '/api/models/custom',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }
+    ),
   deleteCustomModel: (key: string) =>
     request<{ success: boolean }>(`/api/models/custom/${encodeURIComponent(key)}`, {
       method: 'DELETE',
     }),
+  /**
+   * Removes every model one provider node carries (imported custom models plus
+   * the aliases pointing at them) in a single request — the undo for
+   * "Import from /models", which writes hundreds of rows. Catalog models that
+   * ship with the build are not stored per node and are left alone.
+   */
+  deleteProviderModels: (provider: string) =>
+    request<{ status: string; provider: string; removedModels: string[]; removedAliases: string[]; count: number }>(
+      `/api/providers/${encodeURIComponent(provider)}/models`,
+      { method: 'DELETE' }
+    ),
   saveDisabledModels: (provider: string, modelIds: string[]) =>
     request<{ success: boolean }>(`/api/models/disabled/${encodeURIComponent(provider)}`, {
       method: 'PUT',
@@ -1294,11 +1638,37 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(settings),
     }),
+  /**
+   * Reads live USD rates for the requested codes and overlays them on the
+   * stored table. `codes` is the catalog the dashboard offers
+   * (web/src/lib/currency.ts), `ratesStored` counts the rates the provider
+   * answered with, and `ratesMissing` names the requested codes it did not
+   * publish, whose manual rates were kept.
+   */
+  refreshCurrencyRates: (payload: { code: string; showBoth: boolean; codes: string[] }) =>
+    request<{ displayCurrency: unknown; source: string; ratesStored: number; ratesMissing: string[] }>(
+      '/api/settings/currency/refresh',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }
+    ),
   getDatabaseStats: () => request<DatabaseStats>('/api/settings/database/stats'),
   pruneDatabase: () =>
     request<{ success: boolean; pruned: number }>('/api/settings/database/prune', {
       method: 'POST',
     }),
+  pruneUsageHistory: (params?: { days?: number; before?: string; dryRun?: boolean }) => {
+    const query = new URLSearchParams()
+    if (params?.dryRun) query.set('dryRun', '1')
+    if (typeof params?.days === 'number') query.set('days', String(params.days))
+    if (params?.before) query.set('before', params.before)
+    const qs = query.toString()
+    return request<PruneUsageResult>(`/api/settings/database/prune-usage${qs ? `?${qs}` : ''}`, {
+      method: 'POST',
+      body: params?.days || params?.before ? JSON.stringify({ days: params.days, before: params.before }) : undefined,
+    })
+  },
   vacuumDatabase: () =>
     request<{ success: boolean; databaseSizeBytes: number; reclaimableBytes: number }>(
       '/api/settings/database/vacuum',
@@ -1545,11 +1915,19 @@ export const api = {
 
   // Usage & Telemetry
   getUsageStats: (period = 'today') => request<any>(`/api/usage/stats?period=${encodeURIComponent(period)}`),
+  /** One chart point: bucket label (HH:MM or MMM D), totals, and the per-model-family token split. */
   getUsageChart: (period = '7d') =>
-    request<UsageChartPoint[]>(`/api/usage/chart?period=${encodeURIComponent(period)}`),
+    request<{ label: string; tokens: number; cost: number; byModel: Record<string, number> }[]>(
+      `/api/usage/chart?period=${encodeURIComponent(period)}`
+    ),
   getUsageRequestLogs: (limit = 200) => request<string[]>(`/api/usage/request-logs?limit=${limit}`),
-  getRequestDetails: (limit = 50, offset = 0) =>
-    request<any>(`/api/usage/request-details?limit=${limit}&offset=${offset}`),
+  /** Details-section dashboard payload: heatmap days, lifetime cards, node health. */
+  getUsageDashboard: () => request<UsageDashboardResponse>('/api/usage/dashboard'),
+  /** Paged request rows; period windows the server query (?period=<preset|n>d|n>h). */
+  getRequestDetails: (limit = 50, offset = 0, period = '') =>
+    request<any>(
+      `/api/usage/request-details?limit=${limit}&offset=${offset}${period ? `&period=${encodeURIComponent(period)}` : ''}`
+    ),
   /** Full stored payload for one request; the list omits request/response bodies. */
   getRequestDetail: (id: string) => request<any>(`/api/usage/request-details/${encodeURIComponent(id)}`),
   resetHealth: (provider: string, model?: string) =>

@@ -5,10 +5,15 @@ name: Sync Upstream
 # dispatch, and whenever upstream pushes (via `repository_dispatch` sent by the
 # upstream repo's own notify job, if configured).
 #
-# Merge strategy mirrors the previous 9router `sync-mibp` behaviour: merge
-# upstream into this branch with `-X theirs` so upstream wins on conflict. The
-# fork intentionally carries no local patches, so a conflict means an upstream
-# file this fork customized — resolve by hand instead of silently discarding.
+# Merge strategy: a real merge, no `-X theirs`.
+#
+# This fork DOES carry local patches (the dashboard's Logs tab and chart set, the
+# extra usage handlers, the batch test endpoint, the URL-state helpers). The old
+# `-X theirs` resolved every conflict in upstream's favour, so each sync silently
+# discarded those patches while leaving their files and tests behind — which is
+# how `MainTab` lost `'logs'` and `fetchProviderUsage` lost ten provider cases
+# while their tests still expected them. A conflicted merge fails loudly here
+# instead, and a human resolves it once.
 #
 # NOTE: `cancel-in-progress: false` is deliberate. Overlapping runs against the
 # same branch race on the push and can leave the working tree mid-rebase; a
@@ -137,13 +142,21 @@ jobs:
         id: merge
         if: steps.divergence.outputs.behind != '0'
         run: |
-          set -euo pipefail
-          git merge --no-edit \
-            -X theirs \
-            "upstream/${{ env.UPSTREAM_BRANCH }}" \
-            -m "chore(sync): merge upstream ${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }} (${{ github.run_id }})"
-          echo "merged=true" >> "$GITHUB_OUTPUT"
-          echo "changed=true" >> "$GITHUB_OUTPUT"
+          set -uo pipefail
+          # No -X theirs: a conflict here means this fork patched a file upstream
+          # also changed, and discarding the fork's side is what broke the build.
+          # Failing lets a human merge both sides; the branch stays untouched.
+          if git merge --no-edit \
+               "upstream/${{ env.UPSTREAM_BRANCH }}" \
+               -m "chore(sync): merge upstream ${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }} (${{ github.run_id }})"; then
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::error::merge conflict against upstream. Resolve by hand, keeping this fork's local patches:"
+          git diff --name-only --diff-filter=U
+          git merge --abort
+          exit 1
 
       - name: Report what the merge brought in
         if: steps.merge.outputs.merged == 'true'
@@ -189,12 +202,14 @@ jobs:
 
             git fetch origin "${{ env.BRANCH }}"
             # Reset to the new origin tip, then replay the upstream merge on it.
+            # Still no -X theirs: see the "Merge upstream" step for why.
             git reset --hard "origin/${{ env.BRANCH }}"
-            if ! git merge --no-edit -X theirs \
+            if ! git merge --no-edit \
                  "upstream/${{ env.UPSTREAM_BRANCH }}" \
                  -m "$MERGE_MSG (${{ github.run_id }})"; then
               echo "::error::merge conflict against the new origin tip; resolve by hand"
-              git status --short
+              git diff --name-only --diff-filter=U
+              git merge --abort
               exit 1
             fi
             sleep 5

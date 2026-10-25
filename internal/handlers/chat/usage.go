@@ -47,7 +47,13 @@ const maxPersistedErrorLen = 512
 
 // LogFailure persists a bounded, credential-free diagnostic for a failed or
 // aborted request. It intentionally does not touch usageHistory/daily totals.
+//
+// ctx is the request context, and it is not optional: the abort verdict is
+// taken from it, so a call site that passes a nil context records a client
+// abort as an ordinary 502 while the response says 499. The same context and
+// the same classifier decide both, so the row and the response agree.
 func (h *ChatHandler) LogFailure(
+	ctx context.Context,
 	info *UsageLogInfo,
 	usage *translator.OpenAIUsage,
 	err error,
@@ -80,7 +86,7 @@ func (h *ChatHandler) LogFailure(
 	if errors.As(err, &upstreamErr) && upstreamErr.StatusCode > 0 {
 		statusCode = upstreamErr.StatusCode
 	}
-	if isClientCanceled(nil, err) {
+	if isClientCanceled(ctx, err) {
 		statusCode = StatusClientClosedRequest
 	}
 	message := extractErrorText([]byte(err.Error()))
@@ -269,7 +275,15 @@ func (h *ChatHandler) logUsage(ctx context.Context, info *UsageLogInfo, usage *t
 	// the stored row is what the dashboard bills and charts from, so omitting
 	// it makes every reasoning turn look cheaper than it was.
 	tokensJSON := fmt.Sprintf(`{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d,"cached_tokens":%d,"cache_creation_input_tokens":%d,"reasoning_tokens":%d}`, usage.PromptTokens, usage.CompletionTokens, totalTokens, cachedTokens, cacheCreationTokens, usage.ReasoningTokens())
-	if err := h.Repo.InsertUsageHistory(info.Provider, info.Model, info.ConnectionID, maskAPIKey(info.APIKey), info.Endpoint, usage.PromptTokens, usage.CompletionTokens, cost, "success", totalTokens, metaJSON, tokensJSON); err != nil {
+	// The caller is recorded beside the upstream credential (#365). A per-key
+	// token budget is measured from what THAT client spent, and
+	// usageHistory.apiKey holds the provider credential — which attributed every
+	// request to a backend account and left the budget reading zero forever.
+	clientKey := ""
+	if caller := middleware.AuthenticatedApiKeyFromContext(ctx); caller != nil {
+		clientKey = maskAPIKey(caller.Key)
+	}
+	if err := h.Repo.InsertUsageHistory(info.Provider, info.Model, info.ConnectionID, maskAPIKey(info.APIKey), info.Endpoint, usage.PromptTokens, usage.CompletionTokens, cost, "success", totalTokens, metaJSON, tokensJSON, clientKey); err != nil {
 		log.Error("usage", "insert failed", "error", err)
 	}
 
@@ -370,6 +384,9 @@ func (h *ChatHandler) logUsage(ctx context.Context, info *UsageLogInfo, usage *t
 		Timestamp:        now.Format(time.RFC3339),
 		Model:            info.Model,
 		Provider:         info.Provider,
+		RequestedModel:   info.RequestedModel,
+		ComboName:        info.ComboName,
+		LatencyMs:        latencyMs,
 		PromptTokens:     usage.PromptTokens,
 		CompletionTokens: usage.CompletionTokens,
 		CachedTokens:     cachedTokens,

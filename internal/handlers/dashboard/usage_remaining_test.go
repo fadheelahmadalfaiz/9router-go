@@ -160,9 +160,9 @@ func TestFetchGlmUsage_KeysEveryWindowSeparately(t *testing.T) {
 	  {"type":"CREDIT_LIMIT","unit":0,"number":3,"percentage":40},
 	  {"type":"SOMETHING_ELSE","unit":0,"number":9,"percentage":99}
 	]}}`)
-	defer withUsageMapURL(t, glmUsageURLs, "glm", srv.URL)()
+	defer withUsageURL(t, &glmQuotaURLInternational, srv.URL)()
 
-	res := fetchGlmUsage(t.Context(), "key", "glm")
+	res := fetchGLMUsage(t.Context(), "glm", "key")
 	if res.plan != "Pro" {
 		t.Errorf("plan = %q, want the capitalized level", res.plan)
 	}
@@ -189,28 +189,34 @@ func TestFetchGlmUsage_KeysEveryWindowSeparately(t *testing.T) {
 
 func TestFetchGlmUsage_RegionalURLs(t *testing.T) {
 	cn := usageJSONServer(t, `{"data":{"level":"lite","limits":[]}}`)
-	defer withUsageMapURL(t, glmUsageURLs, "glm-cn", cn.URL)()
+	defer withUsageURL(t, &glmQuotaURLChina, cn.URL)()
 
-	if res := fetchGlmUsage(t.Context(), "key", "glm-cn"); res.plan != "Lite" {
+	if res := fetchGLMUsage(t.Context(), "glm-cn", "key"); res.plan != "Lite" {
 		t.Errorf("glm-cn plan = %q, want Lite from the China endpoint", res.plan)
 	}
-	if res := fetchGlmUsage(t.Context(), "key", "unknown-region"); !strings.Contains(res.message, "unknown region") {
-		t.Errorf("message = %q, want it to name the unknown region", res.message)
+
+	// An unrecognised region is not an error: glmQuotaURL falls back to the
+	// international endpoint, so the call must reach that host rather than
+	// refuse the provider.
+	intl := usageJSONServer(t, `{"data":{"level":"pro","limits":[]}}`)
+	defer withUsageURL(t, &glmQuotaURLInternational, intl.URL)()
+	if res := fetchGLMUsage(t.Context(), "unknown-region", "key"); res.plan != "Pro" {
+		t.Errorf("unknown-region plan = %q, want Pro from the international fallback", res.plan)
 	}
 }
 
 func TestFetchGlmUsage_Unauthorized(t *testing.T) {
 	srv := usageStatusServer(t, http.StatusUnauthorized, `{}`)
-	defer withUsageMapURL(t, glmUsageURLs, "glm", srv.URL)()
+	defer withUsageURL(t, &glmQuotaURLInternational, srv.URL)()
 
-	res := fetchGlmUsage(t.Context(), "key", "glm")
+	res := fetchGLMUsage(t.Context(), "glm", "key")
 	if !strings.Contains(res.message, "invalid or expired") {
 		t.Errorf("message = %q, want the invalid-key message", res.message)
 	}
 }
 
 func TestFetchGlmUsage_RequiresKey(t *testing.T) {
-	res := fetchGlmUsage(t.Context(), "  ", "glm")
+	res := fetchGLMUsage(t.Context(), "glm", "  ")
 	if !strings.Contains(res.message, "API key not available") {
 		t.Errorf("message = %q, want it to name the missing key", res.message)
 	}
@@ -786,9 +792,9 @@ func TestFetchProviderUsage_DispatchesEveryHandledProvider(t *testing.T) {
 	t.Cleanup(vercelSrv.Close)
 	restore := withUsageURL(t, &githubUsageURL, gh.URL)
 	defer restore()
-	restore = withUsageMapURL(t, glmUsageURLs, "glm", glmSrv.URL)
+	restore = withUsageURL(t, &glmQuotaURLInternational, glmSrv.URL)
 	defer restore()
-	restore = withUsageMapURL(t, glmUsageURLs, "glm-cn", glmSrv.URL)
+	restore = withUsageURL(t, &glmQuotaURLChina, glmSrv.URL)
 	defer restore()
 	restore = withUsageURL(t, &zedUsageURL, zedSrv.URL)
 	defer restore()
