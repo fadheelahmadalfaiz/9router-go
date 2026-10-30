@@ -170,18 +170,18 @@ jobs:
           CONFLICTS=$(cat "$RUNNER_TEMP/conflicts.txt")
           COUNT=$(printf '%s\n' "$CONFLICTS" | grep -c . || true)
           {
-            printf 'Upstream `%s@%s` moved forward, and the merge conflicts with this fork'"'"'s local patches. Nothing was pushed: `main` is unchanged and still builds.\n\n' "${{ env.UPSTREAM_REPO }}" "${{ env.UPSTREAM_BRANCH }}"
-            printf 'Resolve it locally, keeping **both** sides — the fork'"'"'s patches are why this conflicts:\n\n'
-            printf '```bash\n'
-            printf 'git fetch origin && git checkout main && git pull\n'
-            printf 'git remote add upstream https://github.com/%s.git 2>/dev/null || true\n' "${{ env.UPSTREAM_REPO }}"
-            printf 'git fetch upstream %s\n' "${{ env.UPSTREAM_BRANCH }}"
-            printf 'git merge upstream/%s\n' "${{ env.UPSTREAM_BRANCH }}"
-            printf '# resolve the files below, then:\n'
-            printf 'git add -A && git commit && git push origin main\n'
-            printf '```\n\n'
-            printf 'Conflicting files (%s):\n\n```\n%s\n```\n\n' "$COUNT" "$CONFLICTS"
-            printf 'Run: %s/%s/actions/runs/%s\n' "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}"
+            printf "Upstream \`%s@%s\` moved forward, and the merge conflicts with this fork's local patches. Nothing was pushed: \`main\` is unchanged and still builds.\n\n" "${{ env.UPSTREAM_REPO }}" "${{ env.UPSTREAM_BRANCH }}"
+            printf "Resolve it locally, keeping **both** sides — the fork's patches are why this conflicts:\n\n"
+            printf "\`\`\`bash\n"
+            printf "git fetch origin && git checkout main && git pull\n"
+            printf "git remote add upstream https://github.com/%s.git 2>/dev/null || true\n" "${{ env.UPSTREAM_REPO }}"
+            printf "git fetch upstream %s\n" "${{ env.UPSTREAM_BRANCH }}"
+            printf "git merge upstream/%s\n" "${{ env.UPSTREAM_BRANCH }}"
+            printf "# resolve the files below, then:\n"
+            printf "git add -A && git commit && git push origin main\n"
+            printf "\`\`\`\n\n"
+            printf "Conflicting files (%s):\n\n\`\`\`\n%s\n\`\`\`\n\n" "$COUNT" "$CONFLICTS"
+            printf "Run: %s/%s/actions/runs/%s\n" "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}"
           } > "$RUNNER_TEMP/sync-body.md"
           cat "$RUNNER_TEMP/sync-body.md" >> "$GITHUB_STEP_SUMMARY"
           # Issues are a repository setting and this one has them switched off,
@@ -197,8 +197,8 @@ jobs:
           EXISTING=$(gh issue list --repo "${{ github.repository }}" --state open \
             --search "$TITLE in:title" --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING" ]; then
-            # Edit, do not comment: a scheduled run would otherwise post the same
-            # notice repeatedly.
+            # Edit, do not comment: a repeated sync would otherwise post the same
+            # notice again.
             gh issue edit "$EXISTING" --repo "${{ github.repository }}" --body-file "$RUNNER_TEMP/sync-body.md"
             echo "::notice::issue #$EXISTING already tracks this conflict; updated its file list"
           else
