@@ -78,3 +78,6 @@ stitch-screenshots/
 .omo/run-continuation/
 .omo/omo.jsonc
 .omp/settings.json
+
+# Agent session scratch (plans, transcripts). Not part of the product.
+.tmp/
