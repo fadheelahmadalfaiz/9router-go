@@ -103,6 +103,70 @@ func ClearCustomModelCaps() {
 	InvalidateCapabilitiesCache()
 }
 
+// jailbreakNameMarkers are the tokens a model id carries when the model is
+// sold as uncensored. They are matched as a hyphen/underscore-delimited
+// segment, not a substring: "unrestricted" inside "unrestrictedly-fast" is a
+// false positive, and a bare "jail" is not a marker at all.
+var jailbreakNameMarkers = []string{
+	"uncensored",
+	"unrestricted",
+	"unfiltered",
+	"jailbreak",
+	"jailbroken",
+	"nsfw",
+	"nofilter",
+}
+
+// jailbreakNamePairs are two-token markers: the id spells them as two
+// hyphen-delimited segments ("no-filter"), so a single-segment comparison
+// never sees them. Both segments must be adjacent and in order.
+var jailbreakNamePairs = [][2]string{
+	{"no", "filter"},
+	{"no", "moderation"},
+	{"no", "limits"},
+}
+
+// IsJailbreakModel reports whether a model id names itself uncensored.
+//
+// This is the fallback half of the Jailbreak capability: an operator who never
+// opened the Add Custom Model dialog still gets the chip lit on a model whose
+// id already says what it is. The explicit flag wins either way — the caller
+// ORs the two — so a model marked by hand is never un-marked by a name that
+// happens to contain none of these tokens.
+//
+// A thinking suffix ("(high)") is stripped first, because a level marker is
+// not a name segment and "claude-x(high)" must not be read as a match.
+func IsJailbreakModel(model string) bool {
+	clean := model
+	if paren := strings.IndexByte(clean, '('); paren != -1 {
+		clean = strings.TrimSpace(clean[:paren])
+	}
+	// The bare id is what a marker would be attached to: "vendor/model-jailbreak"
+	// carries it after the slash, and the vendor half is not part of the name.
+	if _, after, ok := strings.CutLast(clean, "/"); ok {
+		clean = after
+	}
+	lower := strings.ToLower(clean)
+	segments := strings.FieldsFunc(lower, func(r rune) bool {
+		return r == '-' || r == '_' || r == '.' || r == ' '
+	})
+	for _, seg := range segments {
+		for _, marker := range jailbreakNameMarkers {
+			if seg == marker {
+				return true
+			}
+		}
+	}
+	for _, pair := range jailbreakNamePairs {
+		for i := 0; i+1 < len(segments); i++ {
+			if segments[i] == pair[0] && segments[i+1] == pair[1] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Capabilities represents what a model can do beyond plain text, plus the shape
 // of its thinking control on the wire. The thinking fields are only meaningful
 // when Reasoning is true; an empty ThinkingFormat means "derive from transport".
@@ -116,6 +180,14 @@ type Capabilities struct {
 	Search      bool
 	Tools       bool
 	Reasoning   bool
+	// Jailbreak reports that the model is uncensored / unrestricted — it
+	// accepts prompts a policy-filtered model refuses. It is not a modality
+	// and not a wire feature: nothing in the request path reads it, and no
+	// upstream table declares it. It exists so an operator can mark the
+	// models they know behave this way and filter the dashboard list on it,
+	// instead of recognising them by name. The name heuristic below is the
+	// fallback for a model whose id already says so.
+	Jailbreak bool
 	// ThinkingFormat is the wire shape of the thinking control
 	// (openai, claude-adaptive, claude-budget, gemini-level, gemini-budget,
 	// zai, qwen, kimi, deepseek, commandcode, minimax, hunyuan, step).
@@ -123,7 +195,7 @@ type Capabilities struct {
 	// ThinkingCanDisable reports whether thinking can be turned off. It is a
 	// pointer because a plain bool cannot say "not specified": upstream's
 	// default is true, and a table entry that names a thinking format without
-	// this flag must still resolve to true. See canDisableThinking.
+	// this flag must still resolve to true. See CanDisableThinking.
 	ThinkingCanDisable *bool
 	// ThinkingRange is the {min, max} budget clamp for budget-based formats.
 	ThinkingRange *ThinkingRange
@@ -143,10 +215,10 @@ type ThinkingRange struct {
 	Max int `json:"max"`
 }
 
-// canDisableThinking resolves the tri-state ThinkingCanDisable flag: an unset
+// CanDisableThinking resolves the tri-state ThinkingCanDisable flag: an unset
 // entry means "not specified", which is upstream's default — thinking can be
 // switched off.
-func canDisableThinking(c Capabilities) bool {
+func (c Capabilities) CanDisableThinking() bool {
 	return c.ThinkingCanDisable == nil || *c.ThinkingCanDisable
 }
 
@@ -177,7 +249,7 @@ var modelCapabilities = map[string]Capabilities{
 	"claude-opus-5.5-thinking-agentic": {Vision: true, Reasoning: true, Search: true, Tools: true, ThinkingFormat: "claude-adaptive"},
 	// Opus 5.5 on Antigravity (upstream v0.5.99, a07ed95b): all five
 	// effort spellings, 1M window / 128K output. thinkingCanDisable:false is
-	// representable here — without it canDisableThinking defaults to true and
+	// representable here — without it CanDisableThinking defaults to true and
 	// the translator drops thinking on any turn that asked for no reasoning,
 	// which Anthropic answers with a 400 on the thinking.type field.
 	//
@@ -245,17 +317,18 @@ var modelCapabilities = map[string]Capabilities{
 	// window. Upstream decolua/9router#4656: z.ai's docs state that "GLM-5.3
 	// and GLM-5.3-FLASH no longer support disabling thinking (an error will
 	// occur if the thinking.type parameter is set to disabled)". Left unset,
-	// canDisableThinking reports true and the translator emits
+	// CanDisableThinking reports true and the translator emits
 	// enable_thinking:false on any turn that asked for no reasoning — z.ai
 	// answers 400 code 1210 "Invalid API parameter". It looked intermittent
 	// because only some turns ask.
+
 	"glm-5.3-flash": {Vision: true, Reasoning: true, Tools: true, ThinkingFormat: "zai", ThinkingCanDisable: new(false)},
 	// claude-fable-5 (no -1 suffix) is adaptive-only like fable-5-1; upstream
 	// capabilities.js only matches it through *claude*fable* -> claude-budget,
 	// which produced thinking{type:"enabled"} and a 400 on the real API.
-	"claude-fable-5":               {Vision: true, Reasoning: true, Search: true, Tools: true, ThinkingFormat: "claude-adaptive"},
-	"claude-fable-5-1":             {Vision: true, Reasoning: true, Search: true, Tools: true, ThinkingFormat: "claude-adaptive", ThinkingCanDisable: new(false), ContextWindow: 1000000, MaxOutput: 128000},
-	"glm-5.2":                      {Reasoning: true, Tools: true, ThinkingFormat: "zai", ThinkingEffortSupported: true, ThinkingCanDisable: new(false)},
+	"claude-fable-5":   {Vision: true, Reasoning: true, Search: true, Tools: true, ThinkingFormat: "claude-adaptive"},
+	"claude-fable-5-1": {Vision: true, Reasoning: true, Search: true, Tools: true, ThinkingFormat: "claude-adaptive", ThinkingCanDisable: new(false), ContextWindow: 1000000, MaxOutput: 128000},
+	"glm-5.2":          {Reasoning: true, Tools: true, ThinkingFormat: "zai", ThinkingEffortSupported: true, ThinkingCanDisable: new(false)},
 	// Upstream b6a9ca43: the exact glm-5.2 entry shadows the *glm-5.2*
 	// pattern completely, so it must repeat the pattern's
 	// ThinkingEffortSupported or reasoning_effort is dropped for GLM-5.2
@@ -278,8 +351,10 @@ var modelCapabilities = map[string]Capabilities{
 	// pattern and lost its vision and 1M window.
 	"deepseek-v4-1-flash":             {Vision: true, Reasoning: true, Tools: true, ThinkingFormat: "deepseek"},
 	"deepseek-flash":                  {Vision: true, Reasoning: true, Tools: true, ThinkingFormat: "deepseek"},
-	"muse-spark-1.2-contributor-free": {Vision: true, Reasoning: true, Tools: true, ThinkingFormat: "openai"},
-	"muse-spark-1.3-contributor-free": {Vision: true, Reasoning: true, Tools: true, ThinkingFormat: "openai"},
+	"muse-spark-1.2-contributor":      {Vision: true, Reasoning: true, Tools: true, ThinkingFormat: "openai", ThinkingCanDisable: new(false)},
+	"muse-spark-1.3-contributor":      {Vision: true, Reasoning: true, Tools: true, ThinkingFormat: "openai", ThinkingCanDisable: new(false)},
+	"muse-spark-1.2-contributor-free": {Vision: true, Reasoning: true, Tools: true, ThinkingFormat: "openai", ThinkingCanDisable: new(false)},
+	"muse-spark-1.3-contributor-free": {Vision: true, Reasoning: true, Tools: true, ThinkingFormat: "openai", ThinkingCanDisable: new(false)},
 	// OpenCode Free ids newer than the tables above (upstream #2690): without
 	// a row they fall through to text-only defaults and the client's
 	// reasoning_effort is stripped before it reaches the upstream. Modality
@@ -299,6 +374,7 @@ var modelCapabilities = map[string]Capabilities{
 	"coder-model":               {Reasoning: true, Tools: true, ThinkingFormat: "qwen"},
 	"kimi-k3":                   {Vision: true, VideoInput: true, Reasoning: true, Tools: true, ThinkingFormat: "kimi", ThinkingCanDisable: new(false)},
 	"k3":                        {Vision: true, VideoInput: true, Reasoning: true, Tools: true, ThinkingFormat: "kimi", ThinkingCanDisable: new(false)},
+	"kimi-k3.1-pro":             {Vision: true, VideoInput: true, Reasoning: true, Tools: true, ThinkingFormat: "kimi", ThinkingCanDisable: new(false), ContextWindow: 1048576, MaxOutput: 131072},
 	"kimi-for-coding":           {Vision: true, VideoInput: true, Reasoning: true, Tools: true, ThinkingFormat: "kimi", ThinkingCanDisable: new(false)},
 	"kimi-for-coding-highspeed": {Vision: true, VideoInput: true, Reasoning: true, Tools: true, ThinkingFormat: "kimi", ThinkingCanDisable: new(false)},
 	"kimi-k2.7-code":            {Vision: true, VideoInput: true, Reasoning: true, Tools: true, ThinkingFormat: "kimi", ThinkingCanDisable: new(false)},
@@ -375,6 +451,10 @@ var providerCapabilities = map[string]map[string]Capabilities{
 	// limit delta for this id, so 1M/131k is what the lane already published.
 	"opencode": {
 		"mimo-v2.6-flash-free": {Vision: true, AudioInput: true, VideoInput: true, Reasoning: true, ThinkingFormat: "openai", ThinkingCanDisable: new(true), ContextWindow: 1048576, MaxOutput: 131072},
+		// The free lane's deepseek-v4.1-flash rejects prompts above ~330k tokens
+		// (upstream #5097); pin the published window so clients compact instead
+		// of hard-failing mid-session.
+		"deepseek-v4.1-flash-free": {Vision: true, Reasoning: true, ThinkingFormat: "deepseek", ContextWindow: 330000, MaxOutput: 128000},
 	},
 	"nvidia": {
 		"minimaxai/minimax-m2.7":        {Reasoning: true, Tools: true, ThinkingFormat: "openai", ThinkingCanDisable: new(false)},
@@ -1136,6 +1216,7 @@ type CapabilitiesDetail struct {
 	Search                  bool    `json:"search"`
 	Tools                   bool    `json:"tools"`
 	Reasoning               bool    `json:"reasoning"`
+	Jailbreak               bool    `json:"jailbreak"`
 	ThinkingFormat          *string `json:"thinkingFormat"`
 	ThinkingCanDisable      bool    `json:"thinkingCanDisable"`
 	ThinkingRange           any     `json:"thinkingRange"`
@@ -1286,8 +1367,9 @@ func GetCapabilitiesDetailForModel(provider, model string) CapabilitiesDetail {
 		Search:                  caps.Search,
 		Tools:                   caps.Tools,
 		Reasoning:               caps.Reasoning,
+		Jailbreak:               caps.Jailbreak || IsJailbreakModel(model),
 		ThinkingFormat:          thinkingFormat,
-		ThinkingCanDisable:      canDisableThinking(caps),
+		ThinkingCanDisable:      caps.CanDisableThinking(),
 		ThinkingRange:           thinkingRange,
 		ThinkingEffortSupported: caps.ThinkingEffortSupported,
 		ContextWindow:           cw,
@@ -1339,6 +1421,9 @@ func applyCustomCaps(dst *Capabilities, custom Capabilities) {
 	}
 	if custom.Reasoning {
 		dst.Reasoning = true
+	}
+	if custom.Jailbreak {
+		dst.Jailbreak = true
 	}
 	if custom.ContextWindow != 0 {
 		dst.ContextWindow = custom.ContextWindow

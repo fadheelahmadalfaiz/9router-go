@@ -141,6 +141,8 @@ export const PROVIDER_ID_TO_ALIAS: Record<string, string> = {
   "xiaomi-mimo": "mimo",
   "xiaomi-tokenplan": "xmtp",
   "zed": "zd",
+  "atmorouter": "atmo",
+  "runcrate": "rc",
 };
 
 const FREEBUFF_MODELS: ProviderModel[] = [
@@ -1036,6 +1038,10 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
   ],
   "cx": [
     {
+      "id": "transcribe",
+      "name": "Codex Transcription"
+    },
+    {
       "id": "gpt-6.1-sol",
       "name": "GPT 6.1 Sol",
       "upstreamModelId": "gpt-6.1-sol"
@@ -1536,6 +1542,10 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
       "name": "DeepSeek V4 Flash"
     },
     {
+      "id": "moonshotai/Kimi-K3.1-Pro",
+      "name": "Kimi K3.1 Pro"
+    },
+    {
       "id": "moonshotai/Kimi-K2.7-Code",
       "name": "Kimi K2.7 Code"
     },
@@ -1731,6 +1741,10 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
     {
       "id": "deepseek-v4-flash-vision-exp",
       "name": "DeepSeek V4 Flash Vision (Exp)"
+    },
+    {
+      "id": "deepseek-flash",
+      "name": "DeepSeek Flash"
     },
     {
       "id": "deepseek-chat",
@@ -2581,6 +2595,22 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
     {
       "id": "grok-4.2",
       "name": "Grok 4.2 (4.20 Beta)"
+    },
+    {
+      "id": "grok-4.20",
+      "name": "Grok 4.20"
+    },
+    {
+      "id": "grok-4.20-beta",
+      "name": "Grok 4.20 Beta"
+    },
+    {
+      "id": "grok-image",
+      "name": "Grok Imagine Image"
+    },
+    {
+      "id": "grok-video",
+      "name": "Grok Imagine Video"
     }
   ],
   "groq": [
@@ -3915,6 +3945,10 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
     {
       "id": "kimi-k3",
       "name": "Kimi K3"
+    },
+    {
+      "id": "kimi-k3.1-pro",
+      "name": "Kimi K3.1 Pro"
     },
     {
       "id": "deepseek-v4-pro",
@@ -5929,6 +5963,24 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
     }
   ],
   "zd": [],
+  "atmo": [
+    { "id": "cc/claude-sonnet-4-6", "name": "Claude Sonnet 4.6" },
+    { "id": "cc/claude-opus-4-7", "name": "Claude Opus 4.7" },
+    { "id": "cx/gpt-5.6-sol", "name": "GPT-5.6 Sol" },
+    { "id": "cb/gemini-3.1-pro", "name": "Gemini 3.1 Pro" },
+    { "id": "cbcn/glm-5.3", "name": "GLM 5.3" },
+    { "id": "ali/kimi-k2.7-code", "name": "Kimi K2.7 Code" },
+    { "id": "ali/qwen3.8-max", "name": "Qwen 3.8 Max" },
+    { "id": "ali/deepseek-v4.1-flash", "name": "DeepSeek V4.1 Flash" }
+  ],
+  "rc": [
+    { "id": "deepseek-ai/DeepSeek-V4.1-Flash", "name": "DeepSeek V4.1 Flash" },
+    { "id": "deepseek-ai/DeepSeek-V4.1-Flash-1017", "name": "DeepSeek V4.1 Flash 1017" },
+    { "id": "zai-org/GLM-5.3", "name": "GLM 5.3" },
+    { "id": "zai-org/GLM-5.3-Flash", "name": "GLM 5.3 Flash" },
+    { "id": "Qwen/Qwen3.8-Flash", "name": "Qwen3.8 Flash" },
+    { "id": "openai/gpt-oss-120b", "name": "gpt-oss 120B" }
+  ],
   "af": [
     {
       "id": "gpt-oss-120b",

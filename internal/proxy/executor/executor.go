@@ -35,7 +35,6 @@ type Request struct {
 	SessionID      string            // client session / conversation id
 	ConnData       map[string]any    // connection providerSpecificData (e.g. fingerprintId for client cloaking)
 	Leases         LeaseStore        // cross-process lease backend (nil = memory only)
-	ProjectID      string            // for gemini-native (antigravity)
 	ModelName      string            // extracted model name
 	Endpoint       string            // custom URL override (azure)
 	ToolNameMap    map[string]string // claude OAuth tool-cloak map (suffixed -> original)
@@ -81,5 +80,13 @@ func Get(provider string) Executor {
 // Default returns the default OpenAI-compat executor.
 func Default() Executor { return ForwardOpenAI }
 
-// IsGeminiNative checks if a config uses gemini-native format.
-func IsGeminiNative(cfg *providers.ProviderConfig) bool { return cfg.Format == "gemini-native" }
+// Release clears internal byte buffers and maps so memory can be collected
+// immediately following upstream dispatch.
+func (r *Request) Release() {
+	if r == nil {
+		return
+	}
+	r.Body = nil
+	r.ConnData = nil
+	r.ToolNameMap = nil
+}

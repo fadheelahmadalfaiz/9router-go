@@ -1,6 +1,19 @@
 package chat
 
 import (
+	"9router/proxy/internal/db"
+	"9router/proxy/internal/handlerutil"
+	"9router/proxy/internal/headroom"
+	"9router/proxy/internal/log"
+	"9router/proxy/internal/middleware"
+	"9router/proxy/internal/observ"
+	"9router/proxy/internal/providers"
+	"9router/proxy/internal/proxy/executor"
+	"9router/proxy/internal/thinking"
+	"9router/proxy/internal/tokensaver"
+	"9router/proxy/internal/tracing"
+	"9router/proxy/internal/translator"
+	"9router/proxy/internal/usagetracker"
 	"bytes"
 	"context"
 	json "encoding/json/v2"
@@ -13,18 +26,7 @@ import (
 	"strings"
 	"time"
 
-	"9router/proxy/internal/handlerutil"
-	"9router/proxy/internal/headroom"
-	"9router/proxy/internal/log"
-	"9router/proxy/internal/middleware"
-	"9router/proxy/internal/observ"
-	"9router/proxy/internal/providers"
 	internalproxy "9router/proxy/internal/proxy"
-	"9router/proxy/internal/proxy/executor"
-	"9router/proxy/internal/tokensaver"
-	"9router/proxy/internal/tracing"
-	"9router/proxy/internal/translator"
-	"9router/proxy/internal/usagetracker"
 )
 
 // StatusClientClosedRequest is the canonical HTTP status for client connection aborts (nginx 499).
@@ -67,6 +69,9 @@ func (h *ChatHandler) handleAccountFallback(
 	translateResponse bool,
 	endpoint string,
 ) error {
+	if FallbackAttemptRecorderFrom(ctx) == nil {
+		ctx = WithFallbackAttemptRecorder(ctx, NewFallbackAttemptRecorder())
+	}
 	body = repairToolCallIDsInJSON(body)
 	if pinnedConnectionID != "" {
 		connObj, connData, err := h.getBestConnectionWithContext(ctx, provider, pinnedConnectionID, nil, model)
@@ -77,7 +82,7 @@ func (h *ChatHandler) handleAccountFallback(
 		return h.tryForwardWithConnection(forwardRequestParams{
 			Ctx: ctx, W: w, Provider: provider, Model: model,
 			ConnectionID: connObj.ID, ConnName: connObjName(connObj), ConnEmail: connObjEmail(connObj),
-			ConnData: connData, Body: body,
+			ConnData: connData, Body: body, Attempts: 1,
 			IsStream: isStream, TranslateResponse: translateResponse, Endpoint: endpoint,
 		})
 	}
@@ -101,7 +106,7 @@ func (h *ChatHandler) handleAccountFallback(
 				return h.tryForwardWithConnection(forwardRequestParams{
 					Ctx: ctx, W: w, Provider: provider, Model: model,
 					ConnectionID: connID, ConnName: connName, ConnEmail: connEmail,
-					ConnData: &ConnectionData{APIKey: apiKey, ProxyPoolID: h.ResolveProviderProxyPoolID(provider)}, Body: body,
+					ConnData: &ConnectionData{APIKey: apiKey, ProxyPoolID: h.ResolveProviderProxyPoolID(provider)}, Body: body, Attempts: 1,
 					IsStream: isStream, TranslateResponse: translateResponse, Endpoint: endpoint,
 				})
 			} else {
@@ -116,7 +121,7 @@ func (h *ChatHandler) handleAccountFallback(
 			proxyPoolID := h.ResolveProviderProxyPoolID(provider)
 			if err := h.tryForwardWithConnection(forwardRequestParams{
 				Ctx: ctx, W: w, Provider: provider, Model: model,
-				ConnectionID: "default", ConnData: &ConnectionData{APIKey: apiKey, ProxyPoolID: proxyPoolID}, Body: body,
+				ConnectionID: "default", ConnData: &ConnectionData{APIKey: apiKey, ProxyPoolID: proxyPoolID}, Body: body, Attempts: 1,
 				IsStream: isStream, TranslateResponse: translateResponse, Endpoint: endpoint,
 			}); err != nil {
 				// Same contract as the multi-connection loop's return: a
@@ -130,13 +135,43 @@ func (h *ChatHandler) handleAccountFallback(
 		return fmt.Errorf("no active connections for provider: %s", provider)
 	}
 
-	// Apply provider connection routing strategy (round-robin, sticky, random) if configured
-	if len(allConns) > 1 && h.Repo != nil {
+	var strat db.ProviderStrategy
+	affinityEligible := false
+	if h.Repo != nil {
 		if settings, sErr := h.Repo.GetSettings(); sErr == nil && settings != nil {
-			strat := connRotationStrategy(settings, provider)
-			if strat.RotateStrategy != "" && strat.RotateStrategy != "none" {
-				allConns = h.applyConnectionStrategy(allConns, strat)
+			strat = connRotationStrategy(settings, provider)
+			affinityEligible = isAffinityEligibleStrategy(strat.RotateStrategy)
+		}
+	}
+
+	// Apply provider connection routing strategy (round-robin, sticky, random) or session affinity
+	if len(allConns) > 1 && strat.RotateStrategy != "" && strat.RotateStrategy != "none" {
+		sessionID := handlerutil.GetSessionID(ctx)
+		hasAffinity := false
+		if sessionID != "" && affinityEligible {
+			if boundID, ok := h.getSessionAffinity().Get(provider, model, sessionID); ok && boundID != "" {
+				for idx, c := range allConns {
+					if c != nil && c.ID == boundID {
+						if idx > 0 {
+							bound := allConns[idx]
+							copy(allConns[1:idx+1], allConns[0:idx])
+							allConns[0] = bound
+						}
+						hasAffinity = true
+						break
+					}
+				}
+				if !hasAffinity {
+					h.getSessionAffinity().Evict(provider, model, sessionID)
+				}
 			}
+		}
+		if !hasAffinity {
+			effectiveStrat := strat
+			if sessionID != "" && affinityEligible {
+				effectiveStrat.StickyLimit = 1
+			}
+			allConns = h.applyConnectionStrategy(allConns, effectiveStrat)
 		}
 	}
 
@@ -173,16 +208,30 @@ func (h *ChatHandler) handleAccountFallback(
 		// to a different account (force fallback), and the usage row, the logs
 		// and the exclusion below must all name the account that was dialled.
 		log.Debug("fallback", "connection", "conn", connObj.ID, "candidate", c.ID)
+		attemptStart := time.Now()
 		if err := h.tryForwardWithConnection(forwardRequestParams{
 			Ctx: ctx, W: w, Provider: provider, Model: model,
 			ConnectionID: connObj.ID, ConnName: connObjName(connObj), ConnEmail: connObjEmail(connObj),
-			ConnData: connData, Body: body,
+			ConnData: connData, Body: body, Attempts: attemptCount(ctx),
 			IsStream: isStream, TranslateResponse: translateResponse, Endpoint: endpoint,
 		}); err == nil {
+			RecordAttemptFromContext(ctx, connObj.ID, connObjName(connObj), provider, model, 200, nil, time.Since(attemptStart).Milliseconds())
+			if sessionID := handlerutil.GetSessionID(ctx); sessionID != "" && affinityEligible {
+				h.getSessionAffinity().Bind(provider, model, sessionID, connObj.ID)
+			}
 			return nil
 		} else {
 			lastErr = err
 			observ.IncFallback(provider, model, observ.FallbackReasonUpstreamError)
+			RecordAttemptFromContext(ctx, connObj.ID, connObjName(connObj), provider, model, 0, err, time.Since(attemptStart).Milliseconds())
+			var ue *upstreamError
+			if errors.As(lastErr, &ue) {
+				if ue.StatusCode == http.StatusTooManyRequests || ue.StatusCode == http.StatusUnauthorized || ue.StatusCode == http.StatusForbidden {
+					if sessionID := handlerutil.GetSessionID(ctx); sessionID != "" {
+						h.getSessionAffinity().Evict(provider, model, sessionID)
+					}
+				}
+			}
 		}
 		// A node-state refusal (contract ended, lifetime quota spent) answers 403, which
 		// is a retryable status, so without this it would fall into the generic branch
@@ -240,7 +289,7 @@ func (h *ChatHandler) handleAccountFallback(
 			// Classify error to get dynamic cooldown; provider-scoped rules
 			// key off the canonical provider the request routed to.
 			classification := providers.ClassifyErrorForProvider(ue.StatusCode, errorText, currentBackoffLevel, provider)
-			cooldownSec := retryableCooldownSec(ue.StatusCode, time.Duration(classification.CooldownMs)*time.Millisecond, ue)
+			cooldownSec := retryableCooldownSec(ue.StatusCode, time.Duration(classification.CooldownMs)*time.Millisecond, ue, provider)
 			errMsg := errorText
 			if errMsg == "" {
 				errMsg = fmt.Sprintf("%d upstream error", ue.StatusCode)
@@ -263,6 +312,7 @@ func (h *ChatHandler) handleAccountFallback(
 				if lockErr := h.Repo.LockConnectionRateLimit(connObj.ID, until, classification.NewBackoffLevel, ue.StatusCode, errorText); lockErr != nil {
 					log.Warn("fallback", "rate limit lock failed", "conn", connObj.ID, "error", lockErr)
 				}
+				h.getSessionAffinity().EvictConnection(connObj.ID)
 			}
 			log.Warn("fallback", "connection locked", append([]any{
 				"conn", connObj.ID, "provider", provider, "model", model,
@@ -421,6 +471,8 @@ func isAnthropicUpstream(provider string, cfg *providers.ProviderConfig) bool {
 		return false
 	}
 	targetURL := cfg.BaseURL
+	// Backward compatibility: if an unmigrated test or caller still supplies
+	// the old header set, resolve the destination from it.
 	if cfg.StaticHeaders != nil {
 		if relayTarget, ok := cfg.StaticHeaders["x-relay-target"]; ok && relayTarget != "" {
 			targetURL = relayTarget + cfg.StaticHeaders["x-relay-path"]
@@ -464,6 +516,7 @@ type forwardRequestParams struct {
 	Model             string
 	RequestedModel    string
 	ComboName         string
+	Attempts          int
 	Protocol          string
 	StartedAt         time.Time
 	ConnectionID      string
@@ -482,6 +535,10 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	connectionID, connData := f.ConnectionID, f.ConnData
 	body, isStream := f.Body, f.IsStream
 	translateResponse, endpoint := f.TranslateResponse, f.Endpoint
+	// Unified thinking normalisation, inbound half: capture the client's
+	// reasoning intent before any converter rewrites the body. model stays
+	// the requested id for logs/usage; wireModel is suffix-free.
+	body, wireModel, thinkingIntent := h.prepareInboundThinking(ctx, provider, model, body, f.Endpoint == "/v1/v1/messages" || f.Endpoint == "/v1/messages")
 	ctx = translator.WithUsageCapture(ctx)
 
 	providerCfg, err := h.getProviderConfig(provider, connData)
@@ -564,7 +621,17 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	// format, whichever of the two ways it earns that: a model routed to a
 	// Messages endpoint (opencode-zen's Claude and Qwen lanes), or an endpoint
 	// that speaks Messages outright (minimax-code on the mavis gateway).
+	// Anthropic's own two provider ids are the third way, and they follow the
+	// same rule chat.go applies when it decides whether to convert at all: it
+	// keeps the body in Claude format for provider "claude"/"anthropic"
+	// whatever base URL the connection carries. Mirrored here, because this
+	// flag is also what says "the body arriving is Claude-shaped" — without
+	// the name check a relay or proxy override made isAnthropic false, the
+	// outbound thinking pass ran with target "openai", and
+	// FilterToOpenAIFormatJSON rewrote a Claude body's tools into
+	// {type:"function",function:{…}} on its way to a Messages API.
 	claudeNative := messagesClient && (isAnthropic ||
+		provider == "claude" || provider == "anthropic" ||
 		executor.ServesMessagesEndpoint(provider, model) ||
 		servesClaudeMessages(provider, providerCfg))
 
@@ -602,7 +669,7 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 			var reqMap map[string]any
 			if err := json.Unmarshal(pipedBody, &reqMap); err == nil {
 				claudeToolMap = cloakClaudeTools(reqMap)
-				if out, err := json.Marshal(reqMap); err == nil {
+				if out, err := json.Marshal(reqMap, json.Deterministic(true)); err == nil {
 					pipedBody = out
 				}
 			}
@@ -613,7 +680,7 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	// redact-thinking beta: it asks Anthropic for signature-only thinking blocks
 	// and would blank exactly what the client requested. The header map is
 	// shared with the registry, so this edits a request-local copy.
-	if isAnthropic && executor.WantsThinkingSummaries(pipedBody) {
+	if isAnthropic && thinking.BodyMentionsThinking(pipedBody) && executor.WantsThinkingSummaries(pipedBody) {
 		providerCfg.StaticHeaders = providers.WithoutBetaFlag(
 			providerCfg.StaticHeaders, providers.AnthropicBetaRedactThinking,
 		)
@@ -663,6 +730,26 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 		log.Debug("fallback", "deduped duplicate tool names", "provider", provider, "model", model)
 		pipedBody = deduped
 	}
+	// DeepSeek (and Kimi) thinking mode requires every assistant message echoed
+	// back with a reasoning_content field whenever the request declares tools;
+	// OpenAI-shaped clients drop it when replaying history, and the API answers
+	// 400 ("The reasoning_content in the thinking mode must be passed back to
+	// the API") without it. A placeholder satisfies the validator; reasoning the
+	// client really sent is preserved. Port of upstream
+	// utils/reasoningContentInjector.js, run at the same last-point-before-
+	// dispatch stage as the tool collapse above. Internal provider/model rules
+	// decide applicability (any provider serving a deepseek/kimi model id), so
+	// the call itself is unconditional on non-Claude lanes.
+	if !upstreamClaude {
+		pipedBody = executor.InjectReasoningContent(pipedBody, provider)
+		if provider == "deepseek" {
+			// DeepSeek V4 models think by default and reject required/named
+			// tool_choice while thinking is on ("Thinking mode does not
+			// support this tool_choice"); downgrade the pin to auto so the
+			// turn is served instead of failing with 400.
+			pipedBody = executor.NormalizeDeepSeekThinkingToolChoice(pipedBody)
+		}
+	}
 
 	// Fit tool names exceeding MaxToolNameLength (64 chars) to prevent upstream HTTP 400.
 	fittedBody, fittedToolMap := translator.FitToolNames(pipedBody)
@@ -696,6 +783,69 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	}
 	if fastBody, modified := ApplyCodexFastMode(pipedBody, provider, accountFastOpt); modified {
 		pipedBody = fastBody
+	}
+
+	// Unified thinking normalisation, outbound half (port of open-sse
+	// applyThinking and filterToOpenAIFormat). Runs last on the wire body so
+	// no converter can resurrect a dialect the target rejects. Claude-native
+	// clients author their own Claude thinking and keep their existing
+	// handling.
+	//
+	// The target format is the wire the upstream speaks, not the shape the
+	// client sent: a Responses-native upstream (opencode, muse, a custom
+	// node on a /responses endpoint) reads reasoning:{effort,summary} and
+	// rejects a top-level reasoning_effort, so the pass runs there too —
+	// upstream applies the thinking pass for every target format
+	// (open-sse/translator/index.js:137). The mandatory-reasoning clamp is
+	// part of the writer, so the Responses lane gets it as well.
+	if !claudeNative {
+		target := "openai"
+		switch {
+		case executor.UpstreamSpeaksResponses(provider, wireModel, providerCfg):
+			target = "openai-responses"
+		case isAnthropic || upstreamClaude:
+			// A provider whose own endpoint speaks the Messages format
+			// (minimax-code on the mavis gateway) gets the Claude wire: its
+			// body was converted above, and the OpenAI filter would strip the
+			// tool_use blocks and rewrite its tools into a shape the Messages
+			// API rejects.
+			target = "claude"
+		}
+		pipedBody = thinking.ApplyJSON(pipedBody, target, provider, wireModel, thinkingIntent)
+		if target == "openai" && !providerCfg.IsGeminiNative() {
+			filtered, filterErr := translator.FilterToOpenAIFormatJSON(pipedBody, translator.FilterOptions{
+				PreserveCacheControl: providers.PreservesCacheControl(provider),
+			})
+			if filterErr != nil {
+				// The request lost every message. The upstream answers an
+				// empty messages array with a 400, so the gateway says so
+				// itself instead of spending the call.
+				return &upstreamError{
+					StatusCode: http.StatusBadRequest,
+					Body:       []byte(`{"error":{"type":"invalid_request_error","message":"the request carries no messages"}}`),
+				}
+			}
+			pipedBody = filtered
+		}
+	}
+
+	// A custom openai-compatible node answers 400 "max_tokens and
+	// max_completion_tokens cannot both be set" on a streaming request that
+	// carries both (repro: bansos/gpt-6-luna on api.sakoo.biz.id — whose
+	// backend is GitHub models). A client may spell either field; when both
+	// are present the explicit max_completion_tokens value wins and
+	// max_tokens is dropped, and when the client sent neither the upstream's
+	// own default is honoured.
+	//
+	// The condition is the wire the body is in, not the client endpoint that
+	// reached here: a /v1/responses client is converted to Chat Completions
+	// before this point when the target speaks Chat (a custom
+	// openai-compatible node), and that conversion keeps both fields as sent.
+	// Gating on the endpoint alone left the pair on the wire for exactly the
+	// lane this fix came from. A Claude body and a Responses body carry
+	// neither field, so the normalizer is a no-op there.
+	if !claudeNative && !upstreamClaude && !executor.UpstreamSpeaksResponses(provider, wireModel, providerCfg) {
+		pipedBody = normalizeChatTokenFields(pipedBody)
 	}
 
 	start := time.Now()
@@ -838,6 +988,10 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 		})
 	}
 
+	// Inject served route response headers (x-9router-provider, x-9router-model, etc.)
+	// before any executor or forwarding function writes headers to w.
+	injectRouteHeaders(w, provider, model, f.ComboName, f.Attempts)
+
 	if exec := executor.Get(provider); exec != nil {
 		execReq := &executor.Request{
 			Ctx:            ctx,
@@ -868,6 +1022,7 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 			execReq.Leases = h.Repo
 		}
 		fwdErr = exec(w, execReq)
+		execReq.Release()
 	} else if providerCfg.IsGeminiNative() {
 		fwdErr = h.forwardGeminiNativeRequest(ctx, w, provider, providerCfg, apiKey, connectionID, pipedBody, isStream, translateResponse, metrics, httpClient)
 	} else {
@@ -914,6 +1069,7 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 					retryReq.Leases = h.Repo
 				}
 				fwdErr = exec(w, retryReq)
+				retryReq.Release()
 			} else if providerCfg.IsGeminiNative() {
 				fwdErr = h.forwardGeminiNativeRequest(ctx, w, provider, providerCfg, apiKey, connectionID, pipedBody, isStream, translateResponse, metrics, httpClient)
 			} else {
@@ -945,6 +1101,9 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	completed := fwdErr == nil
 	if !completed && isClientCanceled(ctx, fwdErr) && metrics != nil && metrics.ResponseBuf.Len() > 0 {
 		completed = true
+	}
+	if !completed && (metrics == nil || metrics.ResponseBuf.Len() == 0) {
+		clearRouteHeaders(w)
 	}
 
 	status := "error"
@@ -1040,6 +1199,7 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 		}
 		logInfo.ConnName, logInfo.ConnEmail = identityNames(h.connIdentityKVOr(f, connectionID))
 		h.logUsage(ctx, logInfo, usage, latencyMs, body, metrics)
+		metrics.ResponseBuf.Reset()
 		fwdErr = nil
 		return nil
 	}
@@ -1101,6 +1261,7 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 		body,
 		metrics,
 	)
+	metrics.ResponseBuf.Reset()
 	if isClientCanceled(ctx, fwdErr) {
 		log.Info("fallback", "client canceled request", append([]any{
 			"provider", provider, "model", model,
@@ -1135,8 +1296,14 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	return fwdErr
 }
 
+// isClientCanceled reports whether the client that asked for this response
+// went away. A deadline the gateway set for itself is not that: the dashboard
+// model probe wraps its own call in a 45s timeout, and treating that expiry as
+// a hangup reported "HTTP 499: client closed request" for a model that was
+// merely still queued upstream. Only an explicit cancel counts, plus the 499
+// this package already produced.
 func isClientCanceled(ctx context.Context, err error) bool {
-	if ctx != nil && ctx.Err() != nil {
+	if ctx != nil && errors.Is(ctx.Err(), context.Canceled) {
 		return true
 	}
 	var ue *upstreamError
@@ -1513,11 +1680,25 @@ func isAccountAuthFailure(lower string) bool {
 		strings.Contains(lower, "insufficient funds for organization")
 }
 
+// isModelQuotaText reports a refusal that names one model's quota rather than
+// the account's standing. These lock the model, not the connection: a Qoder
+// account whose paid models are out of credits still serves its free ones, and
+// parking the whole connection answered `dfmodel` with "all in cooldown" after
+// a single `dmodel` refusal.
 func isModelQuotaText(errorText string) bool {
 	upper := strings.ToUpper(errorText)
 	return strings.Contains(upper, "QUOTA_EXHAUSTED") ||
 		strings.Contains(errorText, "Individual quota reached") ||
-		strings.Contains(upper, "MODEL_CAPACITY_EXHAUSTED")
+		strings.Contains(upper, "MODEL_CAPACITY_EXHAUSTED") ||
+		// Qoder's billing envelope: code 110/112 or a pricingUrl field
+		// (qoderIsBillingBlock). The refusal is per model — the account's
+		// free models keep working while a paid one is out of credits.
+		strings.Contains(upper, "PRICINGURL") ||
+		strings.Contains(upper, "PRICING_URL") ||
+		// Qoder's queue window (qoderQueuedTimeout): the model is briefly out
+		// of capacity, which throttles that model alone. Locking the account
+		// here parked every other model on it behind one busy queue.
+		strings.Contains(upper, "STILL QUEUED")
 }
 
 func mentionsGate(lower string) bool {
