@@ -1,9 +1,8 @@
 name: Sync Upstream
 
-# Keeps this fork's `main` aligned with its real upstream so fixes and provider
-# updates land here without a manual merge. Runs on a schedule, on manual
-# dispatch, and whenever upstream pushes (via `repository_dispatch` sent by the
-# upstream repo's own notify job, if configured).
+# Keeps this fork's `main` aligned with its real upstream. Manual dispatch only:
+# this fork carries local patches, so a sync usually conflicts and needs a human
+# to merge both sides — an hourly run could only ever report that, never finish it.
 #
 # Merge strategy: a real merge, no `-X theirs`.
 #
@@ -12,18 +11,18 @@ name: Sync Upstream
 # `-X theirs` resolved every conflict in upstream's favour, so each sync silently
 # discarded those patches while leaving their files and tests behind — which is
 # how `MainTab` lost `'logs'` and `fetchProviderUsage` lost ten provider cases
-# while their tests still expected them. A conflicted merge fails loudly here
-# instead, and a human resolves it once.
+# while their tests still expected them. A conflict is now reported with the file
+# list and the run stays green, because the branch is never touched either way.
 #
 # NOTE: `cancel-in-progress: false` is deliberate. Overlapping runs against the
 # same branch race on the push and can leave the working tree mid-rebase; a
 # queued run is cheaper than a broken branch.
 
 on:
-  schedule:
-    # Hourly at :07 — offset from the 15-minute slot the 9router sync used so
-    # the two forks never contend for the same runner window.
-    - cron: "7 * * * *"
+  # No hourly schedule on purpose. This fork carries local patches, so a sync
+  # almost always conflicts and needs a human to merge both sides. Running that
+  # every hour only produced a red run 24 times a day for work nobody could do
+  # automatically. Trigger it when a sync is actually wanted.
   workflow_dispatch:
     inputs:
       skip_build:
@@ -184,12 +183,22 @@ jobs:
             printf 'Conflicting files (%s):\n\n```\n%s\n```\n\n' "$COUNT" "$CONFLICTS"
             printf 'Run: %s/%s/actions/runs/%s\n' "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}"
           } > "$RUNNER_TEMP/sync-body.md"
+          cat "$RUNNER_TEMP/sync-body.md" >> "$GITHUB_STEP_SUMMARY"
+          # Issues are a repository setting and this one has them switched off,
+          # so the report has to survive without them. The step summary above is
+          # the always-available channel; an issue is filed only when the repo
+          # actually accepts one.
+          HAS_ISSUES=$(gh api "repos/${{ github.repository }}" --jq '.has_issues' 2>/dev/null || echo false)
+          if [ "$HAS_ISSUES" != "true" ]; then
+            echo "::warning::Merge conflict with upstream; nothing was pushed. Conflicting files are listed in this run's summary."
+            exit 0
+          fi
           TITLE="Sync upstream: merge conflict needs a human"
           EXISTING=$(gh issue list --repo "${{ github.repository }}" --state open \
             --search "$TITLE in:title" --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING" ]; then
-            # Edit, do not comment: the hourly schedule would otherwise post the
-            # same notice 24 times a day.
+            # Edit, do not comment: a scheduled run would otherwise post the same
+            # notice repeatedly.
             gh issue edit "$EXISTING" --repo "${{ github.repository }}" --body-file "$RUNNER_TEMP/sync-body.md"
             echo "::notice::issue #$EXISTING already tracks this conflict; updated its file list"
           else
